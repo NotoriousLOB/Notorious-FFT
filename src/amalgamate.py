@@ -47,7 +47,7 @@ HEADER = """\
  *
  * Options (define before including):
  *   NOTORIOUS_FFT_SINGLE    — use float instead of double
- *   NOTORIOUS_FFT_ACCURATE  — use standard sin/cos instead of fast approximation
+ *   NOTORIOUS_FFT_FAST_MATH — enable fast Bhaskara I sin/cos approximation (~0.1% error)
  *   NOTORIOUS_FFT_OPENMP    — enable OpenMP (requires -fopenmp)
  *
  * License: MIT

@@ -39,6 +39,27 @@ static NOTORIOUS_FFT_INLINE void notorious_fft_butterfly8_avx512(
     _mm512_storeu_pd(&wi[i2], _mm512_sub_pd(ui, vio));
 }
 
+/* Process single butterfly with AVX-512 (8 complex = 4 butterflies) - INVERSE */
+static NOTORIOUS_FFT_INLINE void notorious_fft_butterfly8_avx512_inverse(
+    notorious_fft_real* NOTORIOUS_FFT_RESTRICT wr, notorious_fft_real* NOTORIOUS_FFT_RESTRICT wi,
+    size_t i1, size_t i2,
+    __m512d wr_vec, __m512d wi_vec
+) {
+    __m512d ur = _mm512_loadu_pd(&wr[i1]);
+    __m512d ui = _mm512_loadu_pd(&wi[i1]);
+    __m512d vr = _mm512_loadu_pd(&wr[i2]);
+    __m512d vi = _mm512_loadu_pd(&wi[i2]);
+    
+    /* For inverse: use conj(w) = (wr, -wi), so vr*wr + vi*wi + i*(-vr*wi + vi*wr) */
+    __m512d vro = _mm512_fmadd_pd(vr, wr_vec, _mm512_mul_pd(vi, wi_vec));
+    __m512d vio = _mm512_fmsub_pd(vi, wr_vec, _mm512_mul_pd(vr, wi_vec));
+    
+    _mm512_storeu_pd(&wr[i1], _mm512_add_pd(ur, vro));
+    _mm512_storeu_pd(&wi[i1], _mm512_add_pd(ui, vio));
+    _mm512_storeu_pd(&wr[i2], _mm512_sub_pd(ur, vro));
+    _mm512_storeu_pd(&wi[i2], _mm512_sub_pd(ui, vio));
+}
+
 /* Process single butterfly with AVX-512 (8 complex = 4 butterflies) */
 static NOTORIOUS_FFT_INLINE void notorious_fft_butterfly16_avx512(
     notorious_fft_real* NOTORIOUS_FFT_RESTRICT wr, notorious_fft_real* NOTORIOUS_FFT_RESTRICT wi,
@@ -85,6 +106,27 @@ static NOTORIOUS_FFT_INLINE void notorious_fft_butterfly4_avx2(
     /* Complex multiply */
     __m256d vro = _mm256_fmsub_pd(vr, t_wr, _mm256_mul_pd(vi, t_wi));
     __m256d vio = _mm256_fmadd_pd(vr, t_wi, _mm256_mul_pd(vi, t_wr));
+    
+    _mm256_storeu_pd(&wr[i1], _mm256_add_pd(ur, vro));
+    _mm256_storeu_pd(&wi[i1], _mm256_add_pd(ui, vio));
+    _mm256_storeu_pd(&wr[i2], _mm256_sub_pd(ur, vro));
+    _mm256_storeu_pd(&wi[i2], _mm256_sub_pd(ui, vio));
+}
+
+/* Process single butterfly with AVX2 (4 complex = 2 butterflies) - INVERSE */
+static NOTORIOUS_FFT_INLINE void notorious_fft_butterfly4_avx2_inverse(
+    notorious_fft_real* NOTORIOUS_FFT_RESTRICT wr, notorious_fft_real* NOTORIOUS_FFT_RESTRICT wi,
+    size_t i1, size_t i2,
+    __m256d wr_vec, __m256d wi_vec
+) {
+    __m256d ur = _mm256_loadu_pd(&wr[i1]);
+    __m256d ui = _mm256_loadu_pd(&wi[i1]);
+    __m256d vr = _mm256_loadu_pd(&wr[i2]);
+    __m256d vi = _mm256_loadu_pd(&wi[i2]);
+    
+    /* For inverse: use conj(w) = (wr, -wi), so vr*wr + vi*wi + i*(-vr*wi + vi*wr) */
+    __m256d vro = _mm256_fmadd_pd(vr, wr_vec, _mm256_mul_pd(vi, wi_vec));
+    __m256d vio = _mm256_fmsub_pd(vi, wr_vec, _mm256_mul_pd(vr, wi_vec));
     
     _mm256_storeu_pd(&wr[i1], _mm256_add_pd(ur, vro));
     _mm256_storeu_pd(&wi[i1], _mm256_add_pd(ui, vio));

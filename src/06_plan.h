@@ -50,6 +50,8 @@ static notorious_fft_plan* notorious_fft_create_plan_bluestein(size_t n, int inv
     size_t real_bytes = m * sizeof(notorious_fft_real);
     size_t total = NOTORIOUS_FFT_SLAB_FIELD(sizeof(notorious_fft_plan))
                  + NOTORIOUS_FFT_SLAB_FIELD(real_bytes) * 10;  /* 10 arrays of m reals */
+    /* Round total to alignment - ensures bump starts at aligned address */
+    total = NOTORIOUS_FFT_BUMP_ROUND(total);
 
     void* slab = notorious_fft_malloc(total);
     if (!slab) return NULL;
@@ -144,6 +146,7 @@ static notorious_fft_plan* notorious_fft_create_plan_power2(size_t n) {
               + NOTORIOUS_FFT_SLAB_FIELD((n / 2 + 1) * real_bytes) * 2
               + NOTORIOUS_FFT_SLAB_FIELD(n * real_bytes) * 2;
     } else {
+        /* Round total to alignment - ensures bump starts at aligned address */
         /* Large plan slab layout (high→low):
          *   [notorious_fft_plan]
          *   sr_t       [2n reals]
@@ -158,6 +161,7 @@ static notorious_fft_plan* notorious_fft_create_plan_power2(size_t n) {
               + NOTORIOUS_FFT_SLAB_FIELD((n / 2) * real_bytes) * 2
               + NOTORIOUS_FFT_SLAB_FIELD(2 * n * real_bytes)     /* work_re (2n, work_im aliased) */
               + NOTORIOUS_FFT_SLAB_FIELD(2 * n * real_bytes) * 2;/* sr_e, sr_t */
+        total = NOTORIOUS_FFT_BUMP_ROUND(total);
     }
 
     void* slab = notorious_fft_malloc(total);

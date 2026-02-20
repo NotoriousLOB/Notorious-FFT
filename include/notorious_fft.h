@@ -21,7 +21,7 @@
  *
  * Options (define before including):
  *   NOTORIOUS_FFT_SINGLE    — use float instead of double
- *   NOTORIOUS_FFT_ACCURATE  — use standard sin/cos instead of fast approximation
+ *   NOTORIOUS_FFT_FAST_MATH — enable fast Bhaskara I sin/cos approximation (~0.1% error)
  *   NOTORIOUS_FFT_OPENMP    — enable OpenMP (requires -fopenmp)
  *
  * License: MIT
@@ -321,7 +321,7 @@ static NOTORIOUS_FFT_INLINE void* notorious_fft_malloc(size_t size) {
 #if defined(_MSC_VER)
     ptr = _aligned_malloc(size, 64);
 #elif defined(__APPLE__)
-    if (posix_memalign(&ptr, 64, size) != 0) ptr = malloc(size);
+    if (posix_memalign(&ptr, 64, size) != 0) return NULL;
 #else
     if (posix_memalign(&ptr, 64, size) != 0) return NULL;
 #endif
@@ -458,6 +458,27 @@ static NOTORIOUS_FFT_INLINE void notorious_fft_butterfly8_avx512(
     _mm512_storeu_pd(&wi[i2], _mm512_sub_pd(ui, vio));
 }
 
+/* Process single butterfly with AVX-512 (8 complex = 4 butterflies) - INVERSE */
+static NOTORIOUS_FFT_INLINE void notorious_fft_butterfly8_avx512_inverse(
+    notorious_fft_real* NOTORIOUS_FFT_RESTRICT wr, notorious_fft_real* NOTORIOUS_FFT_RESTRICT wi,
+    size_t i1, size_t i2,
+    __m512d wr_vec, __m512d wi_vec
+) {
+    __m512d ur = _mm512_loadu_pd(&wr[i1]);
+    __m512d ui = _mm512_loadu_pd(&wi[i1]);
+    __m512d vr = _mm512_loadu_pd(&wr[i2]);
+    __m512d vi = _mm512_loadu_pd(&wi[i2]);
+    
+    /* For inverse: use conj(w) = (wr, -wi), so vr*wr + vi*wi + i*(-vr*wi + vi*wr) */
+    __m512d vro = _mm512_fmadd_pd(vr, wr_vec, _mm512_mul_pd(vi, wi_vec));
+    __m512d vio = _mm512_fmsub_pd(vi, wr_vec, _mm512_mul_pd(vr, wi_vec));
+    
+    _mm512_storeu_pd(&wr[i1], _mm512_add_pd(ur, vro));
+    _mm512_storeu_pd(&wi[i1], _mm512_add_pd(ui, vio));
+    _mm512_storeu_pd(&wr[i2], _mm512_sub_pd(ur, vro));
+    _mm512_storeu_pd(&wi[i2], _mm512_sub_pd(ui, vio));
+}
+
 /* Process single butterfly with AVX-512 (8 complex = 4 butterflies) */
 static NOTORIOUS_FFT_INLINE void notorious_fft_butterfly16_avx512(
     notorious_fft_real* NOTORIOUS_FFT_RESTRICT wr, notorious_fft_real* NOTORIOUS_FFT_RESTRICT wi,
@@ -504,6 +525,27 @@ static NOTORIOUS_FFT_INLINE void notorious_fft_butterfly4_avx2(
     /* Complex multiply */
     __m256d vro = _mm256_fmsub_pd(vr, t_wr, _mm256_mul_pd(vi, t_wi));
     __m256d vio = _mm256_fmadd_pd(vr, t_wi, _mm256_mul_pd(vi, t_wr));
+    
+    _mm256_storeu_pd(&wr[i1], _mm256_add_pd(ur, vro));
+    _mm256_storeu_pd(&wi[i1], _mm256_add_pd(ui, vio));
+    _mm256_storeu_pd(&wr[i2], _mm256_sub_pd(ur, vro));
+    _mm256_storeu_pd(&wi[i2], _mm256_sub_pd(ui, vio));
+}
+
+/* Process single butterfly with AVX2 (4 complex = 2 butterflies) - INVERSE */
+static NOTORIOUS_FFT_INLINE void notorious_fft_butterfly4_avx2_inverse(
+    notorious_fft_real* NOTORIOUS_FFT_RESTRICT wr, notorious_fft_real* NOTORIOUS_FFT_RESTRICT wi,
+    size_t i1, size_t i2,
+    __m256d wr_vec, __m256d wi_vec
+) {
+    __m256d ur = _mm256_loadu_pd(&wr[i1]);
+    __m256d ui = _mm256_loadu_pd(&wi[i1]);
+    __m256d vr = _mm256_loadu_pd(&wr[i2]);
+    __m256d vi = _mm256_loadu_pd(&wi[i2]);
+    
+    /* For inverse: use conj(w) = (wr, -wi), so vr*wr + vi*wi + i*(-vr*wi + vi*wr) */
+    __m256d vro = _mm256_fmadd_pd(vr, wr_vec, _mm256_mul_pd(vi, wi_vec));
+    __m256d vio = _mm256_fmsub_pd(vi, wr_vec, _mm256_mul_pd(vr, wi_vec));
     
     _mm256_storeu_pd(&wr[i1], _mm256_add_pd(ur, vro));
     _mm256_storeu_pd(&wi[i1], _mm256_add_pd(ui, vio));
@@ -1063,22 +1105,33 @@ static void notorious_fft_iterative_body_internal(
             #if NOTORIOUS_FFT_HAS_AVX512
             {
                 int32_t indices[8];
-                /* Only use AVX512 for forward transform */
-                if (!inverse) {
-                    for (; j + 8 <= half; j += 8) {
-                        for (int k = 0; k < 8; k++) indices[k] = (int32_t)((j + k) * step);
+                for (; j + 8 <= half; j += 8) {
+                    for (int k = 0; k < 8; k++) indices[k] = (int32_t)((j + k) * step);
+                    if (inverse) {
+                        /* For inverse, negate twiddle imag parts after gather */
+                        __m256i idx = _mm256_loadu_si256((__m256i*)indices);
+                        __m512d t_wr = _mm512_i32gather_pd(idx, tw_re, 8);
+                        __m512d t_wi = _mm512_i32gather_pd(idx, tw_im, 8);
+                        t_wi = _mm512_sub_pd(_mm512_setzero_pd(), t_wi); /* negate */
+                        notorious_fft_butterfly8_avx512_inverse(wr, wi, i + j, i + j + half, t_wr, t_wi);
+                    } else {
                         notorious_fft_butterfly8_avx512(wr, wi, tw_re, tw_im, i + j, i + j + half, indices);
                     }
                 }
             }
             #elif NOTORIOUS_FFT_HAS_AVX2
             {
-                /* Only use AVX2 for forward transform */
-                if (!inverse) {
-                    int32_t idx[4];
-                    for (; j + 4 <= half; j += 4) {
-                        for (int k = 0; k < 4; k++) idx[k] = (int32_t)((j + k) * step);
-                        __m128i indices = _mm_loadu_si128((__m128i*)idx);
+                int32_t idx[4];
+                for (; j + 4 <= half; j += 4) {
+                    for (int k = 0; k < 4; k++) idx[k] = (int32_t)((j + k) * step);
+                    __m128i indices = _mm_loadu_si128((__m128i*)idx);
+                    if (inverse) {
+                        /* For inverse, negate twiddle imag parts after gather */
+                        __m256d t_wr = _mm256_i32gather_pd(tw_re, indices, 8);
+                        __m256d t_wi = _mm256_i32gather_pd(tw_im, indices, 8);
+                        t_wi = _mm256_sub_pd(_mm256_setzero_pd(), t_wi); /* negate */
+                        notorious_fft_butterfly4_avx2_inverse(wr, wi, i + j, i + j + half, t_wr, t_wi);
+                    } else {
                         notorious_fft_butterfly4_avx2(wr, wi, tw_re, tw_im, i + j, i + j + half, indices);
                     }
                 }
@@ -1946,6 +1999,8 @@ static notorious_fft_plan* notorious_fft_create_plan_bluestein(size_t n, int inv
     size_t real_bytes = m * sizeof(notorious_fft_real);
     size_t total = NOTORIOUS_FFT_SLAB_FIELD(sizeof(notorious_fft_plan))
                  + NOTORIOUS_FFT_SLAB_FIELD(real_bytes) * 10;  /* 10 arrays of m reals */
+    /* Round total to alignment - ensures bump starts at aligned address */
+    total = NOTORIOUS_FFT_BUMP_ROUND(total);
 
     void* slab = notorious_fft_malloc(total);
     if (!slab) return NULL;
@@ -2040,6 +2095,7 @@ static notorious_fft_plan* notorious_fft_create_plan_power2(size_t n) {
               + NOTORIOUS_FFT_SLAB_FIELD((n / 2 + 1) * real_bytes) * 2
               + NOTORIOUS_FFT_SLAB_FIELD(n * real_bytes) * 2;
     } else {
+        /* Round total to alignment - ensures bump starts at aligned address */
         /* Large plan slab layout (high→low):
          *   [notorious_fft_plan]
          *   sr_t       [2n reals]
@@ -2054,6 +2110,7 @@ static notorious_fft_plan* notorious_fft_create_plan_power2(size_t n) {
               + NOTORIOUS_FFT_SLAB_FIELD((n / 2) * real_bytes) * 2
               + NOTORIOUS_FFT_SLAB_FIELD(2 * n * real_bytes)     /* work_re (2n, work_im aliased) */
               + NOTORIOUS_FFT_SLAB_FIELD(2 * n * real_bytes) * 2;/* sr_e, sr_t */
+        total = NOTORIOUS_FFT_BUMP_ROUND(total);
     }
 
     void* slab = notorious_fft_malloc(total);

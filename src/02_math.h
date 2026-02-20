@@ -78,7 +78,7 @@ static NOTORIOUS_FFT_INLINE void* notorious_fft_malloc(size_t size) {
 #if defined(_MSC_VER)
     ptr = _aligned_malloc(size, 64);
 #elif defined(__APPLE__)
-    if (posix_memalign(&ptr, 64, size) != 0) ptr = malloc(size);
+    if (posix_memalign(&ptr, 64, size) != 0) return NULL;
 #else
     if (posix_memalign(&ptr, 64, size) != 0) return NULL;
 #endif
