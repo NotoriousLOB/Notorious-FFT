@@ -1,4 +1,10 @@
-# Notorious FFT
+<p align="center">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="/.github/images/logo.png">
+  <source media="(prefers-color-scheme: light)" srcset="/.github/images/logo.png">
+  <img src="/.github/images/logo.png" width="480" alt="Notorious FFT" >
+</picture>	
+</p>
 
 A header-only Fast Fourier Transform library for C/C++.
 
