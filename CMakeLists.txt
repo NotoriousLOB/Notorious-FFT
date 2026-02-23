@@ -29,6 +29,7 @@ add_compile_options(
 
 # ---- SIMD auto-detection ----
 include(CheckCCompilerFlag)
+include(CheckCSourceRuns)
 
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
     check_c_compiler_flag("-march=armv8.2-a+dotprod+fp16" HAVE_ARMV82_DOTPROD)
@@ -55,7 +56,20 @@ elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "arm")
     message(STATUS "ARM 32-bit detected — SIMD flags: ${NOTORIOUS_FFT_ARCH_FLAGS}")
 
 elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
-    check_c_compiler_flag("-mavx512f" HAVE_AVX512F)
+    # Use check_c_source_runs so the test binary actually executes — this catches
+    # the case where the compiler accepts -mavx512f but the CPU doesn't support it.
+    set(_saved_required_flags "${CMAKE_REQUIRED_FLAGS}")
+    set(CMAKE_REQUIRED_FLAGS "-mavx512f -mavx512dq")
+    check_c_source_runs([=[
+#include <immintrin.h>
+int main(void) {
+    __m512d a = _mm512_setzero_pd();
+    __m512d b = _mm512_add_pd(a, a);
+    (void)b;
+    return 0;
+}
+]=] HAVE_AVX512F)
+    set(CMAKE_REQUIRED_FLAGS "${_saved_required_flags}")
     if(HAVE_AVX512F)
         set(NOTORIOUS_FFT_ARCH_FLAGS -mavx512f -mavx512dq -mavx2 -mfma)
         message(STATUS "x86-64 detected — AVX-512 available")

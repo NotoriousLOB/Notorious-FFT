@@ -90,37 +90,37 @@ void test_cpp_complex_dft_1d(int N) {
 	std::string name = "cpp_dft_1d N=" + std::to_string(N);
 	
 	/* Reference using minfft */
-	std::vector<minfft_cmpl> mx(N);
-	std::vector<minfft_cmpl> my(N);
+	std::vector<std::complex<double>> mx(N);
+	std::vector<std::complex<double>> my(N);
 	fill(reinterpret_cast<double*>(mx.data()), 2 * N);
-	
+
 	minfft_aux *ma = minfft_mkaux_dft_1d(N);
-	minfft_dft(mx.data(), my.data(), ma);
+	minfft_dft(reinterpret_cast<minfft_cmpl*>(mx.data()), reinterpret_cast<minfft_cmpl*>(my.data()), ma);
 	minfft_free_aux(ma);
-	
+
 	/* Test using C++ wrapper */
 	std::vector<std::complex<double>> x(N);
 	for (int i = 0; i < N; ++i) {
 		reinterpret_cast<double*>(&x[i])[0] = reinterpret_cast<double*>(&mx[i])[0];
 		reinterpret_cast<double*>(&x[i])[1] = reinterpret_cast<double*>(&mx[i])[1];
 	}
-	
+
 	auto y = notorious_fft::dft(x);
-	
-	check(name, reinterpret_cast<double*>(my.data()), 
+
+	check(name, reinterpret_cast<double*>(my.data()),
 		  reinterpret_cast<double*>(y.data()), 2 * N);
 }
 
 void test_cpp_invdft_1d(int N) {
 	std::string name = "cpp_invdft_1d N=" + std::to_string(N);
-	
+
 	/* Reference using minfft */
-	std::vector<minfft_cmpl> mx(N);
-	std::vector<minfft_cmpl> my(N);
+	std::vector<std::complex<double>> mx(N);
+	std::vector<std::complex<double>> my(N);
 	fill(reinterpret_cast<double*>(mx.data()), 2 * N);
-	
+
 	minfft_aux *ma = minfft_mkaux_dft_1d(N);
-	minfft_invdft(mx.data(), my.data(), ma);
+	minfft_invdft(reinterpret_cast<minfft_cmpl*>(mx.data()), reinterpret_cast<minfft_cmpl*>(my.data()), ma);
 	minfft_free_aux(ma);
 	
 	/* Test using C++ wrapper */
@@ -145,18 +145,18 @@ void test_cpp_realdft_1d(int N) {
 	/* Reference using minfft */
 	std::vector<minfft_real> mx(N);
 	const int out_size = N / 2 + 1;
-	std::vector<minfft_cmpl> my(out_size);
+	std::vector<std::complex<double>> my(out_size);
 	fill(mx.data(), N);
-	
+
 	minfft_aux *ma = minfft_mkaux_realdft_1d(N);
-	minfft_realdft(mx.data(), my.data(), ma);
+	minfft_realdft(mx.data(), reinterpret_cast<minfft_cmpl*>(my.data()), ma);
 	minfft_free_aux(ma);
-	
+
 	/* Test using C++ wrapper */
 	std::vector<double> x(mx.begin(), mx.end());
 	auto y = notorious_fft::realdft(x);
-	
-	check(name, reinterpret_cast<double*>(my.data()), 
+
+	check(name, reinterpret_cast<double*>(my.data()),
 		  reinterpret_cast<double*>(y.data()), 2 * out_size);
 }
 
@@ -165,21 +165,19 @@ void test_cpp_invrealdft_1d(int N) {
 	
 	/* Generate reference using minfft */
 	std::vector<minfft_real> mx(N);
-	std::vector<minfft_cmpl> mz(N / 2 + 1);
+	std::vector<std::complex<double>> mz(N / 2 + 1);
 	std::vector<minfft_real> my(N);
-	
+
 	fill(mx.data(), N);
 	minfft_aux *ma = minfft_mkaux_realdft_1d(N);
-	minfft_realdft(mx.data(), mz.data(), ma);
-	minfft_invrealdft(mz.data(), my.data(), ma);
+	minfft_realdft(mx.data(), reinterpret_cast<minfft_cmpl*>(mz.data()), ma);
+	minfft_invrealdft(reinterpret_cast<minfft_cmpl*>(mz.data()), my.data(), ma);
 	minfft_free_aux(ma);
-	
+
 	/* Test using C++ wrapper */
 	std::vector<std::complex<double>> z(N / 2 + 1);
-	for (size_t i = 0; i < z.size(); ++i) {
-		reinterpret_cast<double*>(&z[i])[0] = reinterpret_cast<double*>(&mz[i])[0];
-		reinterpret_cast<double*>(&z[i])[1] = reinterpret_cast<double*>(&mz[i])[1];
-	}
+	for (size_t i = 0; i < z.size(); ++i)
+		z[i] = mz[i];
 	
 	auto y = notorious_fft::invrealdft(z, N);
 	
@@ -310,14 +308,14 @@ void test_cpp_dft_plan(int N) {
 	std::string name = "cpp_dft_plan N=" + std::to_string(N);
 	
 	/* Reference using minfft */
-	std::vector<minfft_cmpl> mx(N);
-	std::vector<minfft_cmpl> my(N);
+	std::vector<std::complex<double>> mx(N);
+	std::vector<std::complex<double>> my(N);
 	fill(reinterpret_cast<double*>(mx.data()), 2 * N);
-	
+
 	minfft_aux *ma = minfft_mkaux_dft_1d(N);
-	minfft_dft(mx.data(), my.data(), ma);
+	minfft_dft(reinterpret_cast<minfft_cmpl*>(mx.data()), reinterpret_cast<minfft_cmpl*>(my.data()), ma);
 	minfft_free_aux(ma);
-	
+
 	/* Test using C++ plan */
 	notorious_fft::dft_plan plan(N);
 	std::vector<std::complex<double>> x(N);
@@ -338,13 +336,13 @@ void test_cpp_realdft_plan(int N) {
 	/* Reference using minfft */
 	std::vector<minfft_real> mx(N);
 	const int out_size = N / 2 + 1;
-	std::vector<minfft_cmpl> my(out_size);
+	std::vector<std::complex<double>> my(out_size);
 	fill(mx.data(), N);
-	
+
 	minfft_aux *ma = minfft_mkaux_realdft_1d(N);
-	minfft_realdft(mx.data(), my.data(), ma);
+	minfft_realdft(mx.data(), reinterpret_cast<minfft_cmpl*>(my.data()), ma);
 	minfft_free_aux(ma);
-	
+
 	/* Test using C++ plan */
 	notorious_fft::realdft_plan plan(N);
 	std::vector<double> x(mx.begin(), mx.end());
@@ -383,12 +381,12 @@ void test_cpp_dft_2d(int N1, int N2) {
 	const int N = N1 * N2;
 	
 	/* Reference using minfft */
-	std::vector<minfft_cmpl> mx(N);
-	std::vector<minfft_cmpl> my(N);
+	std::vector<std::complex<double>> mx(N);
+	std::vector<std::complex<double>> my(N);
 	fill(reinterpret_cast<double*>(mx.data()), 2 * N);
-	
+
 	minfft_aux *ma = minfft_mkaux_dft_2d(N1, N2);
-	minfft_dft(mx.data(), my.data(), ma);
+	minfft_dft(reinterpret_cast<minfft_cmpl*>(mx.data()), reinterpret_cast<minfft_cmpl*>(my.data()), ma);
 	minfft_free_aux(ma);
 	
 	/* Test using C++ wrapper */
@@ -432,12 +430,12 @@ void test_cpp_dft_in_place(int N) {
 	std::string name = "cpp_dft_in_place N=" + std::to_string(N);
 	
 	/* Reference */
-	std::vector<minfft_cmpl> mx(N);
-	std::vector<minfft_cmpl> my(N);
+	std::vector<std::complex<double>> mx(N);
+	std::vector<std::complex<double>> my(N);
 	fill(reinterpret_cast<double*>(mx.data()), 2 * N);
-	
+
 	minfft_aux *ma = minfft_mkaux_dft_1d(N);
-	minfft_dft(mx.data(), my.data(), ma);
+	minfft_dft(reinterpret_cast<minfft_cmpl*>(mx.data()), reinterpret_cast<minfft_cmpl*>(my.data()), ma);
 	minfft_free_aux(ma);
 	
 	/* Test in-place */

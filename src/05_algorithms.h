@@ -226,8 +226,8 @@ static void notorious_fft_iterative_inplace_cx(
                     double wr0 = tw_re[(j+0)*step], wr1 = tw_re[(j+1)*step];
                     double wi0 = tw_im[(j+0)*step], wi1 = tw_im[(j+1)*step];
                     if (inverse) { wi0 = -wi0; wi1 = -wi1; }
-                    tw_r = _mm256_set_pd(wr1, wr0, wr1, wr0);
-                    tw_i = _mm256_set_pd(wi1, wi0, wi1, wi0);
+                    tw_r = _mm256_set_pd(wr1, wr1, wr0, wr0);
+                    tw_i = _mm256_set_pd(wi1, wi1, wi0, wi0);
                 }
 
                 __m256d ab = _mm256_loadu_pd(&data[2*(i+j)]);

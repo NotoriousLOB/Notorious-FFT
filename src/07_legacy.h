@@ -529,6 +529,26 @@ static void notorious_fft_dct2_neon_1d(notorious_fft_real* x, notorious_fft_real
 #endif /* NOTORIOUS_FFT_HAS_NEON && !defined(NOTORIOUS_FFT_SINGLE) */
 
 /* ============================================================================
+ * DCT/DST-4 helper macros — defined here so AVX2 scalar-tail paths below
+ * can use them before the main notorious_fft_t4_body function is reached.
+ * ============================================================================ */
+
+/* Core premul: t[n].re = er*x_e - ei*x_o,  t[n].im = er*x_o + ei*x_e */
+#define NOTORIOUS_FFT_T4_PREMUL(tr, ti, er, ei, xe, xo) \
+    do { (tr) = (er)*(xe) - (ei)*(xo); (ti) = (er)*(xo) + (ei)*(xe); } while(0)
+
+/* Core premul for DST-4: t[n] = -e_pre[n] * (x[2n] - i*x[N-1-2n])
+ * = (-er*xe - ei*xo) + i*(-er*(-xo) + (-ei)*xe) => simpler:
+ * tr = -er*xe - ei*xo,  ti = er*xo - ei*xe */
+#define NOTORIOUS_FFT_T4_PREMUL_DST(tr, ti, er, ei, xe, xo) \
+    do { (tr) = -(er)*(xe) - (ei)*(xo); (ti) = (er)*(xo) - (ei)*(xe); } while(0)
+
+/* Postmul for DCT-4: re extraction */
+#define NOTORIOUS_FFT_T4_POST_DCT(yk, fr, fi, tr, ti)  ((yk) = 2*((fr)*(tr) - (fi)*(ti)))
+/* Postmul for DST-4: im extraction */
+#define NOTORIOUS_FFT_T4_POST_DST(yk, fr, fi, tr, ti)  ((yk) = 2*((fr)*(ti) + (fi)*(tr)))
+
+/* ============================================================================
  * AVX2 DCT-2 / DST-2 Acceleration (Double Precision)
  * ============================================================================ */
 
@@ -1063,21 +1083,6 @@ void notorious_fft_dst3(notorious_fft_real* x, notorious_fft_real* y, const noto
  *   postmul: y[2k]   = 2 * Im(e_post[2k]   * t[k])
  *            y[2k+1] = 2 * Im(e_post[2k+1] * conj(t[M-1-k]))
  * ============================================================================ */
-
-/* Core premul: t[n].re = er*x_e - ei*x_o,  t[n].im = er*x_o + ei*x_e */
-#define NOTORIOUS_FFT_T4_PREMUL(tr, ti, er, ei, xe, xo) \
-    do { (tr) = (er)*(xe) - (ei)*(xo); (ti) = (er)*(xo) + (ei)*(xe); } while(0)
-
-/* Core premul for DST-4: t[n] = -e_pre[n] * (x[2n] - i*x[N-1-2n])
- * = (-er*xe - ei*xo) + i*(-er*(-xo) + (-ei)*xe) => simpler:
- * tr = -er*xe - ei*xo,  ti = er*xo - ei*xe */
-#define NOTORIOUS_FFT_T4_PREMUL_DST(tr, ti, er, ei, xe, xo) \
-    do { (tr) = -(er)*(xe) - (ei)*(xo); (ti) = (er)*(xo) - (ei)*(xe); } while(0)
-
-/* Postmul for DCT-4: re extraction */
-#define NOTORIOUS_FFT_T4_POST_DCT(yk, fr, fi, tr, ti)  ((yk) = 2*((fr)*(tr) - (fi)*(ti)))
-/* Postmul for DST-4: im extraction */
-#define NOTORIOUS_FFT_T4_POST_DST(yk, fr, fi, tr, ti)  ((yk) = 2*((fr)*(ti) + (fi)*(tr)))
 
 /* Shared inner body: premul + DFT + postmul — used by scalar and unrolled paths.
  * ep_pre  = premul twiddles (M pairs), ep_post = postmul twiddles (N pairs)
