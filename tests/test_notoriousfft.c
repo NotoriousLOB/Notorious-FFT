@@ -949,8 +949,9 @@ int main(void) {
 	printf("\n=== Prime / Rader (incl. Mersenne 31,127 and Fermat 17,257) ===\n");
 	{
 		/* 11,13,17,19,31,37,61,127,257: N−1 is 2·3·5·7-smooth → Rader.
-		 * 23,67: N−1 not smooth → Bluestein. 255=3·5·17 mixed+Rader. */
-		int prime_sizes[] = {11, 13, 17, 19, 23, 31, 37, 61, 67, 127, 255, 257};
+		 * 23,47,53,67: N−1 not smooth → Bluestein (covers AVX inverse IFFT).
+		 * 255=3·5·17 mixed+Rader. */
+		int prime_sizes[] = {11, 13, 17, 19, 23, 31, 37, 47, 53, 61, 67, 127, 255, 257};
 		int np = sizeof(prime_sizes) / sizeof(prime_sizes[0]);
 		for (int i = 0; i < np; i++)
 			test_dft_bluestein(prime_sizes[i]);

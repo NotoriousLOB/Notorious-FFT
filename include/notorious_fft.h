@@ -614,7 +614,7 @@ static NOTORIOUS_FFT_INLINE void notorious_fft_butterfly8_avx512_inverse(
     __m512d vr = _mm512_loadu_pd(&wr[i2]);
     __m512d vi = _mm512_loadu_pd(&wi[i2]);
     
-    /* For inverse: use conj(w) = (wr, -wi), so vr*wr + vi*wi + i*(-vr*wi + vi*wr) */
+    /* conj(w)=(wr,-wi). wr_vec/wi_vec are the *stored* twiddles, not pre-negated. */
     __m512d vro = _mm512_fmadd_pd(vr, wr_vec, _mm512_mul_pd(vi, wi_vec));
     __m512d vio = _mm512_fmsub_pd(vi, wr_vec, _mm512_mul_pd(vr, wi_vec));
     
@@ -688,7 +688,7 @@ static NOTORIOUS_FFT_INLINE void notorious_fft_butterfly4_avx2_inverse(
     __m256d vr = _mm256_loadu_pd(&wr[i2]);
     __m256d vi = _mm256_loadu_pd(&wi[i2]);
     
-    /* For inverse: use conj(w) = (wr, -wi), so vr*wr + vi*wi + i*(-vr*wi + vi*wr) */
+    /* conj(w)=(wr,-wi). wr_vec/wi_vec are the *stored* twiddles, not pre-negated. */
     __m256d vro = _mm256_fmadd_pd(vr, wr_vec, _mm256_mul_pd(vi, wi_vec));
     __m256d vio = _mm256_fmsub_pd(vi, wr_vec, _mm256_mul_pd(vr, wi_vec));
     
@@ -1372,11 +1372,10 @@ static void notorious_fft_iterative_body_internal(
                 for (; j + 8 <= half; j += 8) {
                     for (int k = 0; k < 8; k++) indices[k] = (int32_t)((j + k) * step);
                     if (inverse) {
-                        /* For inverse, negate twiddle imag parts after gather */
+                        /* Inverse kernel already uses conj(w); do not also negate wi. */
                         __m256i idx = _mm256_loadu_si256((__m256i*)indices);
                         __m512d t_wr = _mm512_i32gather_pd(idx, tw_re, 8);
                         __m512d t_wi = _mm512_i32gather_pd(idx, tw_im, 8);
-                        t_wi = _mm512_sub_pd(_mm512_setzero_pd(), t_wi); /* negate */
                         notorious_fft_butterfly8_avx512_inverse(wr, wi, i + j, i + j + half, t_wr, t_wi);
                     } else {
                         notorious_fft_butterfly8_avx512(wr, wi, tw_re, tw_im, i + j, i + j + half, indices);
@@ -1390,10 +1389,9 @@ static void notorious_fft_iterative_body_internal(
                     for (int k = 0; k < 4; k++) idx[k] = (int32_t)((j + k) * step);
                     __m128i indices = _mm_loadu_si128((__m128i*)idx);
                     if (inverse) {
-                        /* For inverse, negate twiddle imag parts after gather */
+                        /* Inverse kernel already uses conj(w); do not also negate wi. */
                         __m256d t_wr = _mm256_i32gather_pd(tw_re, indices, 8);
                         __m256d t_wi = _mm256_i32gather_pd(tw_im, indices, 8);
-                        t_wi = _mm256_sub_pd(_mm256_setzero_pd(), t_wi); /* negate */
                         notorious_fft_butterfly4_avx2_inverse(wr, wi, i + j, i + j + half, t_wr, t_wi);
                     } else {
                         notorious_fft_butterfly4_avx2(wr, wi, tw_re, tw_im, i + j, i + j + half, indices);

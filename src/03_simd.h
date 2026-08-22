@@ -50,7 +50,7 @@ static NOTORIOUS_FFT_INLINE void notorious_fft_butterfly8_avx512_inverse(
     __m512d vr = _mm512_loadu_pd(&wr[i2]);
     __m512d vi = _mm512_loadu_pd(&wi[i2]);
     
-    /* For inverse: use conj(w) = (wr, -wi), so vr*wr + vi*wi + i*(-vr*wi + vi*wr) */
+    /* conj(w)=(wr,-wi). wr_vec/wi_vec are the *stored* twiddles, not pre-negated. */
     __m512d vro = _mm512_fmadd_pd(vr, wr_vec, _mm512_mul_pd(vi, wi_vec));
     __m512d vio = _mm512_fmsub_pd(vi, wr_vec, _mm512_mul_pd(vr, wi_vec));
     
@@ -124,7 +124,7 @@ static NOTORIOUS_FFT_INLINE void notorious_fft_butterfly4_avx2_inverse(
     __m256d vr = _mm256_loadu_pd(&wr[i2]);
     __m256d vi = _mm256_loadu_pd(&wi[i2]);
     
-    /* For inverse: use conj(w) = (wr, -wi), so vr*wr + vi*wi + i*(-vr*wi + vi*wr) */
+    /* conj(w)=(wr,-wi). wr_vec/wi_vec are the *stored* twiddles, not pre-negated. */
     __m256d vro = _mm256_fmadd_pd(vr, wr_vec, _mm256_mul_pd(vi, wi_vec));
     __m256d vio = _mm256_fmsub_pd(vi, wr_vec, _mm256_mul_pd(vr, wi_vec));
     
