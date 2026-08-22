@@ -5,11 +5,10 @@
  * Edit the module files in src/ and re-run CMake.
  *
  * Features:
- *   - Hardcoded kernels for N ≤ 64
- *   - Bluestein algorithm for arbitrary-size support
- *   - SIMD acceleration: NEON (AArch64/ARM), AVX2, AVX-512 (x86-64)
- *   - OpenMP parallelisation
- *   - minfft-compatible API (notorious_fft_ prefix)
+ *   - Split-radix DIF (DIT under MEASURE), mixed-radix 3/5/7, Rader, Bluestein
+ *   - SIMD: NEON, AVX2, AVX-512 (compile-time)
+ *   - FFTW-shaped planner API (see notorious_fft_fftw.h)
+ *   - OpenMP for large independent batches
  *
  * Usage (C):
  *   #define NOTORIOUS_FFT_IMPLEMENTATION
@@ -52,6 +51,13 @@ extern "C" {
 #include <stdint.h>
 #include <time.h>
 
+#define NOTORIOUS_FFT_VERSION_MAJOR 1
+#define NOTORIOUS_FFT_VERSION_MINOR 0
+#define NOTORIOUS_FFT_VERSION_PATCH 0
+#define NOTORIOUS_FFT_VERSION_STRING "1.0.0"
+
+#define NOTORIOUS_FFT_ALIGNMENT 64
+
 /* ============================================================================
  * Configuration
  * ============================================================================ */
@@ -66,6 +72,11 @@ extern "C" {
 
 #ifndef NOTORIOUS_FFT_TIMING_RUNS
 #define NOTORIOUS_FFT_TIMING_RUNS 3  /* Runs for timing-based selection */
+#endif
+
+#ifndef NOTORIOUS_FFT_FOURSTEP_MIN
+/* Three transposes of N complexes dominate below ~2^20; recursive split-radix wins at 64K. */
+#define NOTORIOUS_FFT_FOURSTEP_MIN 1048576
 #endif
 
 /* ============================================================================
@@ -116,6 +127,26 @@ typedef struct notorious_fft_plan {
     notorious_fft_real *sr_e;      /* Split-radix exponent table — same layout as minfft */
     notorious_fft_real *sr_t;      /* Temp buffer for split-radix (n complex = 2*n reals) */
 
+    /* Mixed-radix Cooley–Tukey (N = radix × m, radix ∈ {3,5,7}) */
+    int mixed_radix;        /* 0 = not mixed-radix */
+    struct notorious_fft_plan *mixed_sub;  /* Plan for length m = n/radix */
+
+    /* Rader: prime N with (N-1) 2·3·5·7-smooth. Convolution length N-1. */
+    struct notorious_fft_plan *rader_sub;
+    int *rader_in;                 /* g^j mod N, length N-1 */
+    int *rader_out;                /* g^{-j} mod N, length N-1 */
+    notorious_fft_real *rader_b_re;  /* FFT_{N-1} of ω^{g^{-j}} */
+    notorious_fft_real *rader_b_im;
+
+    /* MEASURE: prefer_iterative / prefer_dit (0 = split-radix DIF, the ESTIMATE default) */
+    int prefer_iterative;
+    int prefer_dit;
+
+    /* Four-step (N = n1 × n2) for large power-of-two transforms */
+    int four_n1, four_n2;
+    struct notorious_fft_plan *four_sub1, *four_sub2;
+    notorious_fft_real *four_tw_re, *four_tw_im;
+
     /* For Bluestein algorithm (non-power-of-2) */
     size_t bluestein_n;     /* Next power of 2 >= 2*n-1 */
     int is_inverse;         /* 1 for inverse FFT, 0 for forward */
@@ -161,6 +192,16 @@ typedef struct notorious_fft_aux {
     #else
         #define NOTORIOUS_FFT_RESTRICT restrict
     #endif
+#endif
+
+#ifndef NOTORIOUS_FFT_PREFETCH
+#if defined(_MSC_VER)
+    #define NOTORIOUS_FFT_PREFETCH(p) _mm_prefetch((const char*)(p), _MM_HINT_T0)
+#elif defined(__GNUC__) || defined(__clang__)
+    #define NOTORIOUS_FFT_PREFETCH(p) __builtin_prefetch((p), 0, 3)
+#else
+    #define NOTORIOUS_FFT_PREFETCH(p) ((void)0)
+#endif
 #endif
 
 /* SIMD Detection */
@@ -335,6 +376,110 @@ static NOTORIOUS_FFT_INLINE void notorious_fft_free(void* ptr) {
     free(ptr);
 #endif
 }
+
+static NOTORIOUS_FFT_INLINE int notorious_fft_alignment(void) {
+    return NOTORIOUS_FFT_ALIGNMENT;
+}
+
+/* Next power of two >= v. Returns 0 on overflow (v too large). */
+static NOTORIOUS_FFT_INLINE size_t notorious_fft_next_pow2(size_t v) {
+    if (v == 0) return 1;
+    if (v > ((size_t)1 << (sizeof(size_t) * 8 - 1))) return 0;
+    v--;
+    v |= v >> 1;
+    v |= v >> 2;
+    v |= v >> 4;
+    v |= v >> 8;
+    v |= v >> 16;
+#if SIZE_MAX > 0xffffffffu
+    v |= v >> 32;
+#endif
+    return v + 1;
+}
+
+/* True iff n = 2^a * 3^b * 5^c * 7^d (and n > 0). */
+static NOTORIOUS_FFT_INLINE int notorious_fft_is_2357_smooth(size_t n) {
+    if (n == 0) return 0;
+    while ((n & 1u) == 0) n >>= 1;
+    while (n % 3u == 0) n /= 3u;
+    while (n % 5u == 0) n /= 5u;
+    while (n % 7u == 0) n /= 7u;
+    return n == 1;
+}
+
+/* True iff n = 2^p − 1 (all bits set). Cheap: (n & (n+1)) == 0.
+ * Mersenne primes are the prime subset (3, 7, 31, 127, …).
+ * Padding one zero and taking a 2^p FFT is NOT an n-point DFT — bin
+ * frequencies are 2πk/2^p, not 2πk/n. Rader is the valid fast path. */
+static NOTORIOUS_FFT_INLINE int notorious_fft_is_mersenne_number(size_t n) {
+    return n != 0 && (n & (n + (size_t)1)) == 0;
+}
+
+static NOTORIOUS_FFT_INLINE int notorious_fft_is_prime(size_t n) {
+    if (n < 2) return 0;
+    if ((n & 1u) == 0) return n == 2;
+    if (n % 3u == 0) return n == 3;
+    if (n % 5u == 0) return n == 5;
+    if (n % 7u == 0) return n == 7;
+    /* i <= n/i avoids overflow on i*i. */
+    for (size_t i = 11, j = 13; i <= n / i; i += 6, j += 6) {
+        if (n % i == 0 || n % j == 0) return 0;
+    }
+    return 1;
+}
+
+/* (b^e) mod m. Residues fit in uint64 when m ≤ 2^32; __int128 otherwise. */
+static NOTORIOUS_FFT_INLINE size_t notorious_fft_modpow(size_t b, size_t e, size_t m) {
+    if (m <= 1) return 0;
+    uint64_t r = 1, bb = (uint64_t)b % (uint64_t)m, mm = (uint64_t)m;
+#if defined(__SIZEOF_INT128__)
+    while (e) {
+        if (e & 1) r = (uint64_t)(((__uint128_t)r * bb) % mm);
+        bb = (uint64_t)(((__uint128_t)bb * bb) % mm);
+        e >>= 1;
+    }
+#else
+    if (mm > 0xffffffffu) return 0;
+    while (e) {
+        if (e & 1) r = (r * bb) % mm;
+        bb = (bb * bb) % mm;
+        e >>= 1;
+    }
+#endif
+    return (size_t)r;
+}
+
+/* Primitive root modulo prime n, or 0. Requires n−1 to be 2·3·5·7-smooth. */
+static NOTORIOUS_FFT_INLINE size_t notorious_fft_primitive_root(size_t n) {
+    if (n < 3) return 0;
+    size_t factors[4];
+    int nf = 0;
+    size_t m = n - 1;
+    if ((m & 1u) == 0) { factors[nf++] = 2; while ((m & 1u) == 0) m >>= 1; }
+    if (m % 3u == 0) { factors[nf++] = 3; while (m % 3u == 0) m /= 3u; }
+    if (m % 5u == 0) { factors[nf++] = 5; while (m % 5u == 0) m /= 5u; }
+    if (m % 7u == 0) { factors[nf++] = 7; while (m % 7u == 0) m /= 7u; }
+    if (m != 1) return 0;
+    for (size_t g = 2; g < n; g++) {
+        int ok = 1;
+        for (int i = 0; i < nf; i++) {
+            if (notorious_fft_modpow(g, (n - 1) / factors[i], n) == 1) {
+                ok = 0;
+                break;
+            }
+        }
+        if (ok) return g;
+    }
+    return 0;
+}
+
+#ifdef NOTORIOUS_FFT_DEBUG
+#include <assert.h>
+#define NOTORIOUS_FFT_ASSERT_ALIGNED(p) \
+    assert(((uintptr_t)(p) & (NOTORIOUS_FFT_ALIGNMENT - 1)) == 0)
+#else
+#define NOTORIOUS_FFT_ASSERT_ALIGNED(p) ((void)0)
+#endif
 
 /* ============================================================================
  * Bump Allocator — decrement-from-end, no per-free bookkeeping
@@ -1048,6 +1193,115 @@ static NOTORIOUS_FFT_INLINE void notorious_fft_kernel_8(notorious_fft_real* re, 
     re[7] = dr2 - tr; im[7] = di2 - ti;
 }
 
+/* ============================================================================
+ * In-place radix-3 / radix-5 butterflies on interleaved data, stride `s`
+ * complexes (i.e. 2*s reals between elements).
+ * ============================================================================ */
+
+static NOTORIOUS_FFT_INLINE void notorious_fft_radix3_stride(
+    notorious_fft_real* x, int s, int inverse)
+{
+    const notorious_fft_real half = (notorious_fft_real)0.5;
+    const notorious_fft_real s3 = (notorious_fft_real)0.866025403784438646763723170752936183;
+    const notorious_fft_real sig = inverse ? s3 : -s3;
+    const int s2 = 2 * s;
+    notorious_fft_real x0r = x[0],     x0i = x[1];
+    notorious_fft_real x1r = x[s2],    x1i = x[s2 + 1];
+    notorious_fft_real x2r = x[2 * s2], x2i = x[2 * s2 + 1];
+    notorious_fft_real ur = x1r + x2r, ui = x1i + x2i;
+    notorious_fft_real vr = x1r - x2r, vi = x1i - x2i;
+    x[0]      = x0r + ur;
+    x[1]      = x0i + ui;
+    x[s2]     = x0r - half * ur - sig * vi;
+    x[s2 + 1] = x0i - half * ui + sig * vr;
+    x[2 * s2]     = x0r - half * ur + sig * vi;
+    x[2 * s2 + 1] = x0i - half * ui - sig * vr;
+}
+
+static NOTORIOUS_FFT_INLINE void notorious_fft_radix5_stride(
+    notorious_fft_real* x, int s, int inverse)
+{
+    /* Direct 5-point DFT with W = exp(∓2πi/5) */
+    const notorious_fft_real c1 = (notorious_fft_real)0.309016994374947424102293417182819059;  /* cos(2π/5) */
+    const notorious_fft_real s1 = (notorious_fft_real)0.951056516295153572116439333379382143;  /* sin(2π/5) */
+    const notorious_fft_real c2 = (notorious_fft_real)-0.809016994374947424102293417182819059; /* cos(4π/5) */
+    const notorious_fft_real s2 = (notorious_fft_real)0.587785252292473129168705954639072768;  /* sin(4π/5) */
+    const notorious_fft_real sg = inverse ? (notorious_fft_real)1.0 : (notorious_fft_real)-1.0;
+    const int stride = 2 * s;
+    notorious_fft_real xr[5], xi[5];
+    for (int n = 0; n < 5; n++) {
+        xr[n] = x[n * stride];
+        xi[n] = x[n * stride + 1];
+    }
+    notorious_fft_real y0r = xr[0] + xr[1] + xr[2] + xr[3] + xr[4];
+    notorious_fft_real y0i = xi[0] + xi[1] + xi[2] + xi[3] + xi[4];
+    notorious_fft_real w1r = c1, w1i = sg * s1;
+    notorious_fft_real w2r = c2, w2i = sg * s2;
+    notorious_fft_real w3r = c2, w3i = -sg * s2; /* W^3 = W^{-2} = conj(W^2) for |W|=1, forward W=e^{-2πi/5} */
+    notorious_fft_real w4r = c1, w4i = -sg * s1;
+    /* For inverse W=e^{+2πi/5}, W^3 = e^{6πi/5} = e^{-4πi/5} = conj of e^{4πi/5} = (c2, -s2) with sg=+1
+     * w3 = (c2, -sg*s2) works for both. W^4 = W^{-1} = conj(W) = (c1, -sg*s1). */
+    notorious_fft_real y1r = xr[0] + xr[1]*w1r - xi[1]*w1i + xr[2]*w2r - xi[2]*w2i
+                           + xr[3]*w3r - xi[3]*w3i + xr[4]*w4r - xi[4]*w4i;
+    notorious_fft_real y1i = xi[0] + xr[1]*w1i + xi[1]*w1r + xr[2]*w2i + xi[2]*w2r
+                           + xr[3]*w3i + xi[3]*w3r + xr[4]*w4i + xi[4]*w4r;
+    notorious_fft_real y2r = xr[0] + xr[1]*w2r - xi[1]*w2i + xr[2]*w4r - xi[2]*w4i
+                           + xr[3]*w1r - xi[3]*w1i + xr[4]*w3r - xi[4]*w3i;
+    notorious_fft_real y2i = xi[0] + xr[1]*w2i + xi[1]*w2r + xr[2]*w4i + xi[2]*w4r
+                           + xr[3]*w1i + xi[3]*w1r + xr[4]*w3i + xi[4]*w3r;
+    notorious_fft_real y3r = xr[0] + xr[1]*w3r - xi[1]*w3i + xr[2]*w1r - xi[2]*w1i
+                           + xr[3]*w4r - xi[3]*w4i + xr[4]*w2r - xi[4]*w2i;
+    notorious_fft_real y3i = xi[0] + xr[1]*w3i + xi[1]*w3r + xr[2]*w1i + xi[2]*w1r
+                           + xr[3]*w4i + xi[3]*w4r + xr[4]*w2i + xi[4]*w2r;
+    notorious_fft_real y4r = xr[0] + xr[1]*w4r - xi[1]*w4i + xr[2]*w3r - xi[2]*w3i
+                           + xr[3]*w2r - xi[3]*w2i + xr[4]*w1r - xi[4]*w1i;
+    notorious_fft_real y4i = xi[0] + xr[1]*w4i + xi[1]*w4r + xr[2]*w3i + xi[2]*w3r
+                           + xr[3]*w2i + xi[3]*w2r + xr[4]*w1i + xi[4]*w1r;
+    x[0]              = y0r; x[1]                  = y0i;
+    x[stride]         = y1r; x[stride + 1]         = y1i;
+    x[2 * stride]     = y2r; x[2 * stride + 1]     = y2i;
+    x[3 * stride]     = y3r; x[3 * stride + 1]     = y3i;
+    x[4 * stride]     = y4r; x[4 * stride + 1]     = y4i;
+}
+
+/* 7-point DFT (FFmpeg tx has a dedicated fft7; we use the same idea: native
+ * radix-7 instead of Bluestein). W^k stored as (cos(2πk/7), ±sin). */
+static NOTORIOUS_FFT_INLINE void notorious_fft_radix7_stride(
+    notorious_fft_real* x, int s, int inverse)
+{
+    const notorious_fft_real c1 = (notorious_fft_real)0.623489801858733530525004884004239737; /* cos(2π/7) */
+    const notorious_fft_real s1 = (notorious_fft_real)0.781831482468029808708444526674057751;
+    const notorious_fft_real c2 = (notorious_fft_real)-0.222520933956314404288902564496794972; /* cos(4π/7) */
+    const notorious_fft_real s2 = (notorious_fft_real)0.974927912181823607018131682993903878;
+    const notorious_fft_real c3 = (notorious_fft_real)-0.900968867902419126236102319507445351; /* cos(6π/7) */
+    const notorious_fft_real s3 = (notorious_fft_real)0.433883739117558120475768332848358754;
+    const notorious_fft_real sg = inverse ? (notorious_fft_real)1.0 : (notorious_fft_real)-1.0;
+    const int st = 2 * s;
+    notorious_fft_real xr[7], xi[7];
+    notorious_fft_real wr[7], wi[7];
+    wr[0] = 1; wi[0] = 0;
+    wr[1] = c1; wi[1] = sg * s1;
+    wr[2] = c2; wi[2] = sg * s2;
+    wr[3] = c3; wi[3] = sg * s3;
+    wr[4] = c3; wi[4] = -sg * s3;
+    wr[5] = c2; wi[5] = -sg * s2;
+    wr[6] = c1; wi[6] = -sg * s1;
+    for (int n = 0; n < 7; n++) {
+        xr[n] = x[n * st];
+        xi[n] = x[n * st + 1];
+    }
+    for (int k = 0; k < 7; k++) {
+        notorious_fft_real sr = 0, si = 0;
+        for (int n = 0; n < 7; n++) {
+            int p = (k * n) % 7;
+            sr += xr[n] * wr[p] - xi[n] * wi[p];
+            si += xr[n] * wi[p] + xi[n] * wr[p];
+        }
+        x[k * st]     = sr;
+        x[k * st + 1] = si;
+    }
+}
+
 /* ==========================================================================
  * 05_algorithms.h
  * ========================================================================== */
@@ -1070,6 +1324,16 @@ static void notorious_fft_execute_bluestein(
     const notorious_fft_plan* plan,
     const notorious_fft_real* NOTORIOUS_FFT_RESTRICT xr_in, const notorious_fft_real* NOTORIOUS_FFT_RESTRICT xi_in,
     notorious_fft_real* NOTORIOUS_FFT_RESTRICT xr_out, notorious_fft_real* NOTORIOUS_FFT_RESTRICT xi_out);
+static void notorious_fft_execute_mixed_cx(const notorious_fft_plan* plan,
+    const notorious_fft_real* x_in, notorious_fft_real* y_out, int inverse);
+static void notorious_fft_execute_four_step(const notorious_fft_plan* plan,
+    const notorious_fft_real* x_in, notorious_fft_real* y_out, int inverse);
+static void notorious_fft_execute_sr_dit(const notorious_fft_plan* plan,
+    const notorious_fft_real* x_in, notorious_fft_real* y_out, int inverse);
+static void notorious_fft_sr_dit_cx(int N, notorious_fft_real* z, const notorious_fft_real* e);
+static void notorious_fft_sr_inv_dit_cx(int N, notorious_fft_real* z, const notorious_fft_real* e);
+static void notorious_fft_execute_rader_cx(const notorious_fft_plan* plan,
+    const notorious_fft_real* x_in, notorious_fft_real* y_out);
 
 /* ============================================================================
  * Iterative Cooley-Tukey FFT
@@ -1176,7 +1440,6 @@ static void notorious_fft_execute_iterative_internal(
 {
     size_t n = plan->n;
     
-    /* Use iterative algorithm - hardcoded kernels have bugs */
     notorious_fft_real* wr = plan->work_re;
     notorious_fft_real* wi = plan->work_im;
     
@@ -1338,15 +1601,47 @@ static void notorious_fft_iterative_inplace_cx(
 }
 
 /* Wrapper that accepts separate in/out buffers.
- * Routes to split-radix DIF (no bit-reversal, better cache) for large N
- * where sr_e/sr_t are available, otherwise falls back to iterative DIT. */
+ * Power-of-2 default is split-radix DIF (no permute). MEASURE may pick
+ * DIT (bit-reverse + unit-stride combine) or iterative Cooley–Tukey. */
 static void notorious_fft_execute_cx(
     const notorious_fft_plan* plan,
     const notorious_fft_real* x_in,   /* interleaved input  */
     notorious_fft_real*       y_out,  /* interleaved output */
     int inverse)
 {
+    if (!plan || !x_in || !y_out) return;
     size_t n = plan->n;
+
+    if (plan->mixed_radix) {
+        notorious_fft_execute_mixed_cx(plan, x_in, y_out, inverse);
+        return;
+    }
+
+    if (plan->rader_sub) {
+        if (!inverse) {
+            notorious_fft_execute_rader_cx(plan, x_in, y_out);
+            return;
+        }
+        /* IDFT(x) = conj(DFT(conj(x))) — unnormalized */
+        if (x_in != y_out) {
+            for (size_t i = 0; i < n; i++) {
+                y_out[2 * i]     =  x_in[2 * i];
+                y_out[2 * i + 1] = -x_in[2 * i + 1];
+            }
+        } else {
+            for (size_t i = 0; i < n; i++)
+                y_out[2 * i + 1] = -y_out[2 * i + 1];
+        }
+        notorious_fft_execute_rader_cx(plan, y_out, y_out);
+        for (size_t i = 0; i < n; i++)
+            y_out[2 * i + 1] = -y_out[2 * i + 1];
+        return;
+    }
+
+    if (plan->four_n1 && !plan->prefer_iterative) {
+        notorious_fft_execute_four_step(plan, x_in, y_out, inverse);
+        return;
+    }
 
     /* Bluestein (non-power-of-2): deinterleave → split execute → reinterleave.
      * work_re/im are not used by notorious_fft_execute_bluestein, safe for input.
@@ -1363,7 +1658,9 @@ static void notorious_fft_execute_cx(
             in_im[i] = x_in[2*i+1];
         }
 
-        /* Handle inverse via conjugate trick: IDFT(x) = (1/N)*conj(DFT(conj(x))) */
+        /* Inverse via conjugate identity (unnormalized, FFTW/minfft semantics):
+         *   IDFT(x) = conj(DFT(conj(x)))
+         * No 1/N — the inner Bluestein 1/M factor is the convolution IFFT only. */
         if (inverse) {
             for (size_t i = 0; i < n; i++) in_im[i] = -in_im[i];
         }
@@ -1371,10 +1668,9 @@ static void notorious_fft_execute_cx(
         notorious_fft_execute_bluestein(plan, in_re, in_im, out_re, out_im);
 
         if (inverse) {
-            notorious_fft_real scale = (notorious_fft_real)1.0 / (notorious_fft_real)n;
             for (size_t i = 0; i < n; i++) {
-                y_out[2*i]   =  out_re[i] * scale;
-                y_out[2*i+1] = -out_im[i] * scale;
+                y_out[2*i]   =  out_re[i];
+                y_out[2*i+1] = -out_im[i];
             }
         } else {
             for (size_t i = 0; i < n; i++) {
@@ -1385,7 +1681,9 @@ static void notorious_fft_execute_cx(
         return;
     }
 
-    if (plan->sr_e && plan->sr_t && n >= 16) {
+    if (plan->prefer_dit && plan->sr_e && plan->bitrev && n >= 64 && !plan->prefer_iterative) {
+        notorious_fft_execute_sr_dit(plan, x_in, y_out, inverse);
+    } else if (plan->sr_e && plan->sr_t && n >= 16 && !plan->prefer_iterative) {
         notorious_fft_execute_sr_dif(plan, x_in, y_out, inverse);
     } else {
         if (x_in != y_out)
@@ -1477,15 +1775,113 @@ static void notorious_fft_sr_dif_cx(int N, notorious_fft_real* x, notorious_fft_
         return;
     }
 
+    /* N=16: FFmpeg-style — hardcoded twiddles (cos table of n/4), no ep[] gather. */
+    if (N == 16) {
+        const notorious_fft_real c8 = NOTORIOUS_FFT_INV_SQRT2;
+        const notorious_fft_real c1 = (notorious_fft_real)0.923879532511286756128183189396788287; /* cos(π/8) */
+        const notorious_fft_real s1 = (notorious_fft_real)0.382683432365089771728459984030398867; /* sin(π/8) */
+#define NOTORIOUS_FFT_SR16(k, wr, wi, w3r, w3i) do { \
+            notorious_fft_real x0r=xr[2*(k)],x0i=xi[2*(k)]; \
+            notorious_fft_real x1r=xr[2*((k)+8)],x1i=xi[2*((k)+8)]; \
+            notorious_fft_real x2r=xr[2*((k)+4)],x2i=xi[2*((k)+4)]; \
+            notorious_fft_real x3r=xr[2*((k)+12)],x3i=xi[2*((k)+12)]; \
+            notorious_fft_real t0r=x0r+x1r,t0i=x0i+x1i; \
+            notorious_fft_real t1r=x2r+x3r,t1i=x2i+x3i; \
+            notorious_fft_real t2r=x0r-x1r,t2i=x0i-x1i; \
+            notorious_fft_real t3r=x3i-x2i,t3i=x2r-x3r; \
+            notorious_fft_real ur=t2r-t3r,ui=t2i-t3i; \
+            notorious_fft_real vr=t2r+t3r,vi=t2i+t3i; \
+            tr[2*(k)]=t0r; ti[2*(k)]=t0i; \
+            tr[2*((k)+4)]=t1r; ti[2*((k)+4)]=t1i; \
+            tr[2*((k)+8)]=ur*(wr)-ui*(wi); ti[2*((k)+8)]=ur*(wi)+ui*(wr); \
+            tr[2*((k)+12)]=vr*(w3r)-vi*(w3i); ti[2*((k)+12)]=vr*(w3i)+vi*(w3r); \
+        } while (0)
+        NOTORIOUS_FFT_SR16(0, 1, 0, 1, 0);
+        NOTORIOUS_FFT_SR16(1, c1, -s1, s1, -c1);
+        NOTORIOUS_FFT_SR16(2, c8, -c8, -c8, -c8);
+        NOTORIOUS_FFT_SR16(3, s1, -c1, -c1, s1);
+#undef NOTORIOUS_FFT_SR16
+        notorious_fft_sr_dif_cx(8, t,    t,    y,      2*sy, e);
+        notorious_fft_sr_dif_cx(4, t+16, t+16, y+2*sy, 4*sy, e);
+        notorious_fft_sr_dif_cx(4, t+24, t+24, y+6*sy, 4*sy, e);
+        return;
+    }
+
+    /* N=32: one scalar stage then N=16 + 2×N=8 (FFmpeg DECL_SR_CODELET(32,16,8)). */
+    if (N == 32) {
+        int n4 = 8;
+        const notorious_fft_real* ep = e;
+        for (int k = 0; k < n4; k++) {
+            notorious_fft_real x0r=xr[2*k],x0i=xi[2*k];
+            notorious_fft_real x1r=xr[2*(k+16)],x1i=xi[2*(k+16)];
+            notorious_fft_real x2r=xr[2*(k+8)],x2i=xi[2*(k+8)];
+            notorious_fft_real x3r=xr[2*(k+24)],x3i=xi[2*(k+24)];
+            notorious_fft_real t0r_=x0r+x1r,t0i_=x0i+x1i;
+            notorious_fft_real t1r_=x2r+x3r,t1i_=x2i+x3i;
+            notorious_fft_real t2r_=x0r-x1r,t2i_=x0i-x1i;
+            notorious_fft_real t3r_=x3i-x2i,t3i_=x2r-x3r;
+            notorious_fft_real ur_=t2r_-t3r_,ui_=t2i_-t3i_;
+            notorious_fft_real vr_=t2r_+t3r_,vi_=t2i_+t3i_;
+            tr[2*k]=t0r_; ti[2*k]=t0i_;
+            tr[2*(k+8)]=t1r_; ti[2*(k+8)]=t1i_;
+            tr[2*(k+16)]=ur_*ep[4*k]-ui_*ep[4*k+1];
+            ti[2*(k+16)]=ur_*ep[4*k+1]+ui_*ep[4*k];
+            tr[2*(k+24)]=vr_*ep[4*k+2]-vi_*ep[4*k+3];
+            ti[2*(k+24)]=vr_*ep[4*k+3]+vi_*ep[4*k+2];
+        }
+        const notorious_fft_real* e_next = e + 32;
+        notorious_fft_sr_dif_cx(16, t,    t,    y,      2*sy, e_next);
+        notorious_fft_sr_dif_cx(8,  t+32, t+32, y+2*sy, 4*sy, e_next + 16);
+        notorious_fft_sr_dif_cx(8,  t+48, t+48, y+6*sy, 4*sy, e_next + 16);
+        return;
+    }
+
     /* General recursion: split-radix DIF butterfly stage then recurse */
-    /* N >= 16 */
+    /* N >= 64 */
     int n4 = N / 4;
     const notorious_fft_real* ep = e;  /* points to current level's twiddles */
 
     {
         int k = 0;
 
-#if NOTORIOUS_FFT_HAS_AVX2 && !defined(NOTORIOUS_FFT_SINGLE)
+#if NOTORIOUS_FFT_HAS_AVX512 && !defined(NOTORIOUS_FFT_SINGLE)
+        for (; k + 4 <= n4; k += 4) {
+            __m512d w1r = _mm512_set_pd(ep[4*(k+3)], ep[4*(k+3)], ep[4*(k+2)], ep[4*(k+2)],
+                                        ep[4*(k+1)], ep[4*(k+1)], ep[4*k],   ep[4*k]);
+            __m512d w1i = _mm512_set_pd(ep[4*(k+3)+1], ep[4*(k+3)+1], ep[4*(k+2)+1], ep[4*(k+2)+1],
+                                        ep[4*(k+1)+1], ep[4*(k+1)+1], ep[4*k+1], ep[4*k+1]);
+            __m512d w3r = _mm512_set_pd(ep[4*(k+3)+2], ep[4*(k+3)+2], ep[4*(k+2)+2], ep[4*(k+2)+2],
+                                        ep[4*(k+1)+2], ep[4*(k+1)+2], ep[4*k+2], ep[4*k+2]);
+            __m512d w3i = _mm512_set_pd(ep[4*(k+3)+3], ep[4*(k+3)+3], ep[4*(k+2)+3], ep[4*(k+2)+3],
+                                        ep[4*(k+1)+3], ep[4*(k+1)+3], ep[4*k+3], ep[4*k+3]);
+            __m512d a = _mm512_loadu_pd(xr + 2*k);
+            __m512d b = _mm512_loadu_pd(xr + 2*(k+N/2));
+            __m512d c = _mm512_loadu_pd(xr + 2*(k+n4));
+            __m512d d = _mm512_loadu_pd(xr + 2*(k+3*n4));
+            __m512d t0 = _mm512_add_pd(a, b);
+            __m512d t1 = _mm512_add_pd(c, d);
+            __m512d t2 = _mm512_sub_pd(a, b);
+            __m512d cd_diff = _mm512_sub_pd(c, d);
+            __m512d cd_swap = _mm512_permute_pd(cd_diff, 0x55);
+            __m512d sign_mask = _mm512_set_pd(1.0, -1.0, 1.0, -1.0, 1.0, -1.0, 1.0, -1.0);
+            __m512d t3 = _mm512_mul_pd(cd_swap, sign_mask);
+            __m512d u = _mm512_sub_pd(t2, t3);
+            __m512d v = _mm512_add_pd(t2, t3);
+            _mm512_storeu_pd(tr + 2*k, t0);
+            _mm512_storeu_pd(tr + 2*(k+n4), t1);
+            __m512d u_swap = _mm512_permute_pd(u, 0x55);
+            __m512d p1 = _mm512_mul_pd(u, w1r);
+            __m512d p2 = _mm512_mul_pd(u_swap, w1i);
+            __m512d cmul_sign = _mm512_set_pd(1.0, -1.0, 1.0, -1.0, 1.0, -1.0, 1.0, -1.0);
+            __m512d uw1 = _mm512_fmadd_pd(p2, cmul_sign, p1);
+            _mm512_storeu_pd(tr + 2*(k+N/2), uw1);
+            __m512d v_swap = _mm512_permute_pd(v, 0x55);
+            __m512d q1 = _mm512_mul_pd(v, w3r);
+            __m512d q2 = _mm512_mul_pd(v_swap, w3i);
+            __m512d vw3 = _mm512_fmadd_pd(q2, cmul_sign, q1);
+            _mm512_storeu_pd(tr + 2*(k+3*n4), vw3);
+        }
+#elif NOTORIOUS_FFT_HAS_AVX2 && !defined(NOTORIOUS_FFT_SINGLE)
         /* AVX2 double: process 2 complex per iteration using 256-bit ops.
          * Load 4 doubles {re0,im0,re1,im1}, deinterleave with permute. */
         for (; k + 2 <= n4; k += 2) {
@@ -1525,7 +1921,7 @@ static void notorious_fft_sr_dif_cx(int N, notorious_fft_real* x, notorious_fft_
             __m256d p1 = _mm256_mul_pd(u, w1r);           /* {ur*wr, ui*wr, ...} */
             __m256d p2 = _mm256_mul_pd(u_swap, w1i);      /* {ui*wi, ur*wi, ...} */
             __m256d cmul_sign = _mm256_set_pd(1.0, -1.0, 1.0, -1.0);
-            __m256d uw1 = _mm256_add_pd(p1, _mm256_mul_pd(p2, cmul_sign));
+            __m256d uw1 = _mm256_fmadd_pd(p2, cmul_sign, p1);
 
             _mm256_storeu_pd(tr + 2*(k+N/2), uw1);
 
@@ -1533,7 +1929,7 @@ static void notorious_fft_sr_dif_cx(int N, notorious_fft_real* x, notorious_fft_
             __m256d v_swap = _mm256_shuffle_pd(v, v, 0x5);
             __m256d q1 = _mm256_mul_pd(v, w3r);
             __m256d q2 = _mm256_mul_pd(v_swap, w3i);
-            __m256d vw3 = _mm256_add_pd(q1, _mm256_mul_pd(q2, cmul_sign));
+            __m256d vw3 = _mm256_fmadd_pd(q2, cmul_sign, q1);
 
             _mm256_storeu_pd(tr + 2*(k+3*n4), vw3);
         }
@@ -1577,6 +1973,39 @@ static void notorious_fft_sr_dif_cx(int N, notorious_fft_real* x, notorious_fft_
             float64x2_t qi_ = vaddq_f64(vmulq_f64(vr_,w3i), vmulq_f64(vi_,w3r));
             float64x2x2_t out3 = {{qr_, qi_}};
             vst2q_f64(tr + 2*(k+3*n4), out3);
+        }
+#elif NOTORIOUS_FFT_HAS_NEON && defined(NOTORIOUS_FFT_SINGLE)
+        for (; k + 4 <= n4; k += 4) {
+            float32x4_t w1r = (float32x4_t){ep[4*k],   ep[4*(k+1)], ep[4*(k+2)], ep[4*(k+3)]};
+            float32x4_t w1i = (float32x4_t){ep[4*k+1], ep[4*(k+1)+1], ep[4*(k+2)+1], ep[4*(k+3)+1]};
+            float32x4_t w3r = (float32x4_t){ep[4*k+2], ep[4*(k+1)+2], ep[4*(k+2)+2], ep[4*(k+3)+2]};
+            float32x4_t w3i = (float32x4_t){ep[4*k+3], ep[4*(k+1)+3], ep[4*(k+2)+3], ep[4*(k+3)+3]};
+            float32x4x2_t xa = vld2q_f32(xr + 2*k);
+            float32x4x2_t xb = vld2q_f32(xr + 2*(k+N/2));
+            float32x4x2_t xc = vld2q_f32(xr + 2*(k+n4));
+            float32x4x2_t xd = vld2q_f32(xr + 2*(k+3*n4));
+            float32x4_t t0r_ = vaddq_f32(xa.val[0], xb.val[0]);
+            float32x4_t t0i_ = vaddq_f32(xa.val[1], xb.val[1]);
+            float32x4_t t1r_ = vaddq_f32(xc.val[0], xd.val[0]);
+            float32x4_t t1i_ = vaddq_f32(xc.val[1], xd.val[1]);
+            float32x4_t t2r_ = vsubq_f32(xa.val[0], xb.val[0]);
+            float32x4_t t2i_ = vsubq_f32(xa.val[1], xb.val[1]);
+            float32x4_t t3r_ = vsubq_f32(xd.val[1], xc.val[1]);
+            float32x4_t t3i_ = vsubq_f32(xc.val[0], xd.val[0]);
+            float32x4_t ur_ = vsubq_f32(t2r_, t3r_), ui_ = vsubq_f32(t2i_, t3i_);
+            float32x4_t vr_ = vaddq_f32(t2r_, t3r_), vi_ = vaddq_f32(t2i_, t3i_);
+            float32x4x2_t out0 = {{t0r_, t0i_}};
+            vst2q_f32(tr + 2*k, out0);
+            float32x4x2_t out1 = {{t1r_, t1i_}};
+            vst2q_f32(tr + 2*(k+n4), out1);
+            float32x4_t pr_ = vsubq_f32(vmulq_f32(ur_,w1r), vmulq_f32(ui_,w1i));
+            float32x4_t pi_ = vaddq_f32(vmulq_f32(ur_,w1i), vmulq_f32(ui_,w1r));
+            float32x4x2_t out2 = {{pr_, pi_}};
+            vst2q_f32(tr + 2*(k+N/2), out2);
+            float32x4_t qr_ = vsubq_f32(vmulq_f32(vr_,w3r), vmulq_f32(vi_,w3i));
+            float32x4_t qi_ = vaddq_f32(vmulq_f32(vr_,w3i), vmulq_f32(vi_,w3r));
+            float32x4x2_t out3 = {{qr_, qi_}};
+            vst2q_f32(tr + 2*(k+3*n4), out3);
         }
 #endif
 
@@ -1686,15 +2115,118 @@ static void notorious_fft_sr_inv_dif_cx(int N, notorious_fft_real* x, notorious_
         return;
     }
 
+    if (N == 16) {
+        const notorious_fft_real c8 = NOTORIOUS_FFT_INV_SQRT2;
+        const notorious_fft_real c1 = (notorious_fft_real)0.923879532511286756128183189396788287;
+        const notorious_fft_real s1 = (notorious_fft_real)0.382683432365089771728459984030398867;
+#define NOTORIOUS_FFT_SR16I(k, wr, wi, w3r, w3i) do { \
+            notorious_fft_real x0r=xr[2*(k)],x0i=xi[2*(k)]; \
+            notorious_fft_real x1r=xr[2*((k)+8)],x1i=xi[2*((k)+8)]; \
+            notorious_fft_real x2r=xr[2*((k)+4)],x2i=xi[2*((k)+4)]; \
+            notorious_fft_real x3r=xr[2*((k)+12)],x3i=xi[2*((k)+12)]; \
+            notorious_fft_real t0r=x0r+x1r,t0i=x0i+x1i; \
+            notorious_fft_real t1r=x2r+x3r,t1i=x2i+x3i; \
+            notorious_fft_real t2r=x0r-x1r,t2i=x0i-x1i; \
+            notorious_fft_real t3r=x3i-x2i,t3i=x2r-x3r; \
+            notorious_fft_real ur=t2r+t3r,ui=t2i+t3i; \
+            notorious_fft_real vr=t2r-t3r,vi=t2i-t3i; \
+            tr[2*(k)]=t0r; ti[2*(k)]=t0i; \
+            tr[2*((k)+4)]=t1r; ti[2*((k)+4)]=t1i; \
+            tr[2*((k)+8)]=ur*(wr)+ui*(wi); ti[2*((k)+8)]=-ur*(wi)+ui*(wr); \
+            tr[2*((k)+12)]=vr*(w3r)+vi*(w3i); ti[2*((k)+12)]=-vr*(w3i)+vi*(w3r); \
+        } while (0)
+        /* Same forward twiddles; formula uses conj(w). */
+        NOTORIOUS_FFT_SR16I(0, 1, 0, 1, 0);
+        NOTORIOUS_FFT_SR16I(1, c1, -s1, s1, -c1);
+        NOTORIOUS_FFT_SR16I(2, c8, -c8, -c8, -c8);
+        NOTORIOUS_FFT_SR16I(3, s1, -c1, -c1, s1);
+#undef NOTORIOUS_FFT_SR16I
+        notorious_fft_sr_inv_dif_cx(8, t,    t,    y,      2*sy, e);
+        notorious_fft_sr_inv_dif_cx(4, t+16, t+16, y+2*sy, 4*sy, e);
+        notorious_fft_sr_inv_dif_cx(4, t+24, t+24, y+6*sy, 4*sy, e);
+        return;
+    }
+
+    if (N == 32) {
+        int n4 = 8;
+        const notorious_fft_real* ep = e;
+        for (int k = 0; k < n4; k++) {
+            notorious_fft_real x0r=xr[2*k],x0i=xi[2*k];
+            notorious_fft_real x1r=xr[2*(k+16)],x1i=xi[2*(k+16)];
+            notorious_fft_real x2r=xr[2*(k+8)],x2i=xi[2*(k+8)];
+            notorious_fft_real x3r=xr[2*(k+24)],x3i=xi[2*(k+24)];
+            notorious_fft_real t0r_=x0r+x1r,t0i_=x0i+x1i;
+            notorious_fft_real t1r_=x2r+x3r,t1i_=x2i+x3i;
+            notorious_fft_real t2r_=x0r-x1r,t2i_=x0i-x1i;
+            notorious_fft_real t3r_=x3i-x2i,t3i_=x2r-x3r;
+            notorious_fft_real ur_=t2r_+t3r_,ui_=t2i_+t3i_;
+            notorious_fft_real vr_=t2r_-t3r_,vi_=t2i_-t3i_;
+            tr[2*k]=t0r_; ti[2*k]=t0i_;
+            tr[2*(k+8)]=t1r_; ti[2*(k+8)]=t1i_;
+            tr[2*(k+16)]=ur_*ep[4*k]+ui_*ep[4*k+1];
+            ti[2*(k+16)]=-ur_*ep[4*k+1]+ui_*ep[4*k];
+            tr[2*(k+24)]=vr_*ep[4*k+2]+vi_*ep[4*k+3];
+            ti[2*(k+24)]=-vr_*ep[4*k+3]+vi_*ep[4*k+2];
+        }
+        const notorious_fft_real* e_next = e + 32;
+        notorious_fft_sr_inv_dif_cx(16, t,    t,    y,      2*sy, e_next);
+        notorious_fft_sr_inv_dif_cx(8,  t+32, t+32, y+2*sy, 4*sy, e_next + 16);
+        notorious_fft_sr_inv_dif_cx(8,  t+48, t+48, y+6*sy, 4*sy, e_next + 16);
+        return;
+    }
+
     /* General recursion: inverse split-radix DIF butterfly */
-    /* N >= 16 */
+    /* N >= 64 */
     int n4 = N / 4;
     const notorious_fft_real* ep = e;
 
     {
         int k = 0;
 
-#if NOTORIOUS_FFT_HAS_NEON && !defined(NOTORIOUS_FFT_SINGLE)
+#if NOTORIOUS_FFT_HAS_AVX2 && !defined(NOTORIOUS_FFT_SINGLE)
+        for (; k + 2 <= n4; k += 2) {
+            __m256d w1r = _mm256_set_pd(ep[4*(k+1)],   ep[4*(k+1)],   ep[4*k],   ep[4*k]);
+            __m256d w1i = _mm256_set_pd(ep[4*(k+1)+1], ep[4*(k+1)+1], ep[4*k+1], ep[4*k+1]);
+            __m256d w3r = _mm256_set_pd(ep[4*(k+1)+2], ep[4*(k+1)+2], ep[4*k+2], ep[4*k+2]);
+            __m256d w3i = _mm256_set_pd(ep[4*(k+1)+3], ep[4*(k+1)+3], ep[4*k+3], ep[4*k+3]);
+
+            __m256d a = _mm256_loadu_pd(xr + 2*k);
+            __m256d b = _mm256_loadu_pd(xr + 2*(k+N/2));
+            __m256d c = _mm256_loadu_pd(xr + 2*(k+n4));
+            __m256d d = _mm256_loadu_pd(xr + 2*(k+3*n4));
+
+            __m256d t0 = _mm256_add_pd(a, b);
+            __m256d t1 = _mm256_add_pd(c, d);
+            __m256d t2 = _mm256_sub_pd(a, b);
+            __m256d cd_diff = _mm256_sub_pd(c, d);
+
+            __m256d cd_swap = _mm256_shuffle_pd(cd_diff, cd_diff, 0x5);
+            __m256d sign_mask = _mm256_set_pd(1.0, -1.0, 1.0, -1.0);
+            __m256d t3 = _mm256_mul_pd(cd_swap, sign_mask);
+
+            /* Inverse: u = t2+t3, v = t2-t3 */
+            __m256d u = _mm256_add_pd(t2, t3);
+            __m256d v = _mm256_sub_pd(t2, t3);
+
+            _mm256_storeu_pd(tr + 2*k, t0);
+            _mm256_storeu_pd(tr + 2*(k+n4), t1);
+
+            /* u * conj(w1): re = ur*wr + ui*wi, im = ui*wr - ur*wi */
+            __m256d u_swap = _mm256_shuffle_pd(u, u, 0x5);
+            __m256d p1 = _mm256_mul_pd(u, w1r);
+            __m256d p2 = _mm256_mul_pd(u_swap, w1i);
+            __m256d cmul_sign = _mm256_set_pd(-1.0, 1.0, -1.0, 1.0);
+            __m256d uw1 = _mm256_fmadd_pd(p2, cmul_sign, p1);
+            _mm256_storeu_pd(tr + 2*(k+N/2), uw1);
+
+            __m256d v_swap = _mm256_shuffle_pd(v, v, 0x5);
+            __m256d q1 = _mm256_mul_pd(v, w3r);
+            __m256d q2 = _mm256_mul_pd(v_swap, w3i);
+            __m256d vw3 = _mm256_fmadd_pd(q2, cmul_sign, q1);
+            _mm256_storeu_pd(tr + 2*(k+3*n4), vw3);
+        }
+
+#elif NOTORIOUS_FFT_HAS_NEON && !defined(NOTORIOUS_FFT_SINGLE)
         for (; k + 2 <= n4; k += 2) {
             float64x2_t w1r = (float64x2_t){ep[4*k],   ep[4*(k+1)]};
             float64x2_t w1i = (float64x2_t){ep[4*k+1], ep[4*(k+1)+1]};
@@ -1736,6 +2268,39 @@ static void notorious_fft_sr_inv_dif_cx(int N, notorious_fft_real* x, notorious_
             float64x2x2_t out3 = {{qr_, qi_}};
             vst2q_f64(tr + 2*(k+3*n4), out3);
         }
+#elif NOTORIOUS_FFT_HAS_NEON && defined(NOTORIOUS_FFT_SINGLE)
+        for (; k + 4 <= n4; k += 4) {
+            float32x4_t w1r = (float32x4_t){ep[4*k],   ep[4*(k+1)], ep[4*(k+2)], ep[4*(k+3)]};
+            float32x4_t w1i = (float32x4_t){ep[4*k+1], ep[4*(k+1)+1], ep[4*(k+2)+1], ep[4*(k+3)+1]};
+            float32x4_t w3r = (float32x4_t){ep[4*k+2], ep[4*(k+1)+2], ep[4*(k+2)+2], ep[4*(k+3)+2]};
+            float32x4_t w3i = (float32x4_t){ep[4*k+3], ep[4*(k+1)+3], ep[4*(k+2)+3], ep[4*(k+3)+3]};
+            float32x4x2_t xa = vld2q_f32(xr + 2*k);
+            float32x4x2_t xb = vld2q_f32(xr + 2*(k+N/2));
+            float32x4x2_t xc = vld2q_f32(xr + 2*(k+n4));
+            float32x4x2_t xd = vld2q_f32(xr + 2*(k+3*n4));
+            float32x4_t t0r_ = vaddq_f32(xa.val[0], xb.val[0]);
+            float32x4_t t0i_ = vaddq_f32(xa.val[1], xb.val[1]);
+            float32x4_t t1r_ = vaddq_f32(xc.val[0], xd.val[0]);
+            float32x4_t t1i_ = vaddq_f32(xc.val[1], xd.val[1]);
+            float32x4_t t2r_ = vsubq_f32(xa.val[0], xb.val[0]);
+            float32x4_t t2i_ = vsubq_f32(xa.val[1], xb.val[1]);
+            float32x4_t t3r_ = vsubq_f32(xd.val[1], xc.val[1]);
+            float32x4_t t3i_ = vsubq_f32(xc.val[0], xd.val[0]);
+            float32x4_t ur_ = vaddq_f32(t2r_, t3r_), ui_ = vaddq_f32(t2i_, t3i_);
+            float32x4_t vr_ = vsubq_f32(t2r_, t3r_), vi_ = vsubq_f32(t2i_, t3i_);
+            float32x4x2_t out0 = {{t0r_, t0i_}};
+            vst2q_f32(tr + 2*k, out0);
+            float32x4x2_t out1 = {{t1r_, t1i_}};
+            vst2q_f32(tr + 2*(k+n4), out1);
+            float32x4_t pr_ = vaddq_f32(vmulq_f32(ur_,w1r), vmulq_f32(ui_,w1i));
+            float32x4_t pi_ = vsubq_f32(vmulq_f32(ui_,w1r), vmulq_f32(ur_,w1i));
+            float32x4x2_t out2 = {{pr_, pi_}};
+            vst2q_f32(tr + 2*(k+N/2), out2);
+            float32x4_t qr_ = vaddq_f32(vmulq_f32(vr_,w3r), vmulq_f32(vi_,w3i));
+            float32x4_t qi_ = vsubq_f32(vmulq_f32(vi_,w3r), vmulq_f32(vr_,w3i));
+            float32x4x2_t out3 = {{qr_, qi_}};
+            vst2q_f32(tr + 2*(k+3*n4), out3);
+        }
 #endif
 
         /* Scalar remainder / fallback */
@@ -1775,15 +2340,483 @@ static void notorious_fft_execute_sr_dif(
     int inverse)
 {
     int N = (int)plan->n;
-    notorious_fft_real* t = plan->sr_t;  /* temp buffer: 2*N reals */
-
-    /* Copy input to temp (sr_dif writes to t during butterfly stage) */
-    memcpy(t, x_in, (size_t)(2*N) * sizeof(notorious_fft_real));
+    /* First stage only reads x; recursion lives in work_re. x_in may alias y_out. */
     if (inverse) {
-        notorious_fft_sr_inv_dif_cx(N, t, plan->work_re, y_out, 1, plan->sr_e);
+        notorious_fft_sr_inv_dif_cx(N, (notorious_fft_real*)x_in, plan->work_re, y_out, 1, plan->sr_e);
     } else {
-        notorious_fft_sr_dif_cx(N, t, plan->work_re, y_out, 1, plan->sr_e);
+        notorious_fft_sr_dif_cx(N, (notorious_fft_real*)x_in, plan->work_re, y_out, 1, plan->sr_e);
     }
+}
+
+/* ============================================================================
+ * Split-radix DIT — bit-reversed input, unit-stride combine
+ *
+ * Dual of the DIF recursion: sub-FFTs first, then the 2/4 butterfly.
+ * After a single bit-reversal gather, every stage is contiguous (stride 1),
+ * which vectorizes and caches better than DIF's growing output stride.
+ *
+ * Layout after the N/2 + N/4 + N/4 subtransforms:
+ *   z[0 .. N/2)       even DFT U
+ *   z[N/2 .. 3N/4)    DFT of x[4n+1]  (V)
+ *   z[3N/4 .. N)      DFT of x[4n+3]  (W)
+ *
+ *   t2 = V[k] W_N^k ,  t3 = W[k] W_N^{3k} ,  u = t2+t3 ,  d = t2-t3
+ *   X[k]      = U[k] + u
+ *   X[k+N/2]  = U[k] - u
+ *   X[k+N/4]  = U[k+N/4] - i d     (forward; +i d inverse)
+ *   X[k+3N/4] = U[k+N/4] + i d
+ * ============================================================================ */
+
+static NOTORIOUS_FFT_INLINE void notorious_fft_dit_combine1(
+    notorious_fft_real* z, int k, int n4, int n2,
+    notorious_fft_real w1r, notorious_fft_real w1i,
+    notorious_fft_real w3r, notorious_fft_real w3i,
+    int inverse)
+{
+    notorious_fft_real ukr = z[2 * k],           uki = z[2 * k + 1];
+    notorious_fft_real u2r = z[2 * (k + n4)],    u2i = z[2 * (k + n4) + 1];
+    notorious_fft_real vr  = z[2 * (k + n2)],    vi  = z[2 * (k + n2) + 1];
+    notorious_fft_real wr  = z[2 * (k + n2 + n4)], wi = z[2 * (k + n2 + n4) + 1];
+    notorious_fft_real t2r, t2i, t3r, t3i;
+    if (!inverse) {
+        t2r = vr * w1r - vi * w1i; t2i = vr * w1i + vi * w1r;
+        t3r = wr * w3r - wi * w3i; t3i = wr * w3i + wi * w3r;
+    } else {
+        t2r = vr * w1r + vi * w1i; t2i = vi * w1r - vr * w1i;
+        t3r = wr * w3r + wi * w3i; t3i = wi * w3r - wr * w3i;
+    }
+    notorious_fft_real ur = t2r + t3r, ui = t2i + t3i;
+    notorious_fft_real dr = t2r - t3r, di = t2i - t3i;
+    z[2 * k]                = ukr + ur; z[2 * k + 1]                = uki + ui;
+    z[2 * (k + n2)]         = ukr - ur; z[2 * (k + n2) + 1]         = uki - ui;
+    if (!inverse) {
+        z[2 * (k + n4)]         = u2r + di; z[2 * (k + n4) + 1]         = u2i - dr;
+        z[2 * (k + n2 + n4)]    = u2r - di; z[2 * (k + n2 + n4) + 1]    = u2i + dr;
+    } else {
+        z[2 * (k + n4)]         = u2r - di; z[2 * (k + n4) + 1]         = u2i + dr;
+        z[2 * (k + n2 + n4)]    = u2r + di; z[2 * (k + n2 + n4) + 1]    = u2i - dr;
+    }
+}
+
+static void notorious_fft_sr_dit_cx(int N, notorious_fft_real* z, const notorious_fft_real* e)
+{
+    if (N == 1)
+        return;
+    if (N == 2) {
+        notorious_fft_real t0r = z[0] + z[2], t0i = z[1] + z[3];
+        notorious_fft_real t1r = z[0] - z[2], t1i = z[1] - z[3];
+        z[0] = t0r; z[1] = t0i; z[2] = t1r; z[3] = t1i;
+        return;
+    }
+    if (N == 4) {
+        notorious_fft_real t0r = z[0] + z[2], t0i = z[1] + z[3];
+        notorious_fft_real t1r = z[0] - z[2], t1i = z[1] - z[3];
+        notorious_fft_real vr = z[4], vi = z[5], wr = z[6], wi = z[7];
+        notorious_fft_real ur = vr + wr, ui = vi + wi;
+        notorious_fft_real dr = vr - wr, di = vi - wi;
+        z[0] = t0r + ur; z[1] = t0i + ui;
+        z[4] = t0r - ur; z[5] = t0i - ui;
+        z[2] = t1r + di; z[3] = t1i - dr; /* U1 − i d */
+        z[6] = t1r - di; z[7] = t1i + dr; /* U1 + i d */
+        return;
+    }
+    if (N == 8) {
+        const notorious_fft_real c8 = NOTORIOUS_FFT_INV_SQRT2;
+        notorious_fft_sr_dit_cx(4, z, e);
+        notorious_fft_sr_dit_cx(2, z + 8, e);
+        notorious_fft_sr_dit_cx(2, z + 12, e);
+        notorious_fft_dit_combine1(z, 0, 2, 4, 1, 0, 1, 0, 0);
+        notorious_fft_dit_combine1(z, 1, 2, 4, c8, -c8, -c8, -c8, 0);
+        return;
+    }
+    if (N == 16) {
+        const notorious_fft_real c8 = NOTORIOUS_FFT_INV_SQRT2;
+        const notorious_fft_real c1 = (notorious_fft_real)0.923879532511286756128183189396788287;
+        const notorious_fft_real s1 = (notorious_fft_real)0.382683432365089771728459984030398867;
+        notorious_fft_sr_dit_cx(8, z, e);
+        notorious_fft_sr_dit_cx(4, z + 16, e);
+        notorious_fft_sr_dit_cx(4, z + 24, e);
+        notorious_fft_dit_combine1(z, 0, 4, 8, 1, 0, 1, 0, 0);
+        notorious_fft_dit_combine1(z, 1, 4, 8, c1, -s1, s1, -c1, 0);
+        notorious_fft_dit_combine1(z, 2, 4, 8, c8, -c8, -c8, -c8, 0);
+        notorious_fft_dit_combine1(z, 3, 4, 8, s1, -c1, -c1, s1, 0);
+        return;
+    }
+
+    /* N ≥ 32 */
+    const notorious_fft_real* e_next = e + N;
+    notorious_fft_sr_dit_cx(N / 2, z, e_next);
+    notorious_fft_sr_dit_cx(N / 4, z + N, e_next + N / 2);
+    notorious_fft_sr_dit_cx(N / 4, z + 3 * (N / 2), e_next + N / 2);
+
+    int n4 = N / 4, n2 = N / 2;
+    const notorious_fft_real* ep = e;
+    int k = 0;
+
+#if NOTORIOUS_FFT_HAS_NEON && !defined(NOTORIOUS_FFT_SINGLE)
+    for (; k + 2 <= n4; k += 2) {
+        float64x2_t w1r = (float64x2_t){ep[4 * k], ep[4 * (k + 1)]};
+        float64x2_t w1i = (float64x2_t){ep[4 * k + 1], ep[4 * (k + 1) + 1]};
+        float64x2_t w3r = (float64x2_t){ep[4 * k + 2], ep[4 * (k + 1) + 2]};
+        float64x2_t w3i = (float64x2_t){ep[4 * k + 3], ep[4 * (k + 1) + 3]};
+        float64x2x2_t uk = vld2q_f64(z + 2 * k);
+        float64x2x2_t u2 = vld2q_f64(z + 2 * (k + n4));
+        float64x2x2_t vv = vld2q_f64(z + 2 * (k + n2));
+        float64x2x2_t ww = vld2q_f64(z + 2 * (k + n2 + n4));
+        float64x2_t t2r = vsubq_f64(vmulq_f64(vv.val[0], w1r), vmulq_f64(vv.val[1], w1i));
+        float64x2_t t2i = vaddq_f64(vmulq_f64(vv.val[0], w1i), vmulq_f64(vv.val[1], w1r));
+        float64x2_t t3r = vsubq_f64(vmulq_f64(ww.val[0], w3r), vmulq_f64(ww.val[1], w3i));
+        float64x2_t t3i = vaddq_f64(vmulq_f64(ww.val[0], w3i), vmulq_f64(ww.val[1], w3r));
+        float64x2_t ur = vaddq_f64(t2r, t3r), ui = vaddq_f64(t2i, t3i);
+        float64x2_t dr = vsubq_f64(t2r, t3r), di = vsubq_f64(t2i, t3i);
+        float64x2x2_t x0 = {{vaddq_f64(uk.val[0], ur), vaddq_f64(uk.val[1], ui)}};
+        float64x2x2_t x2 = {{vsubq_f64(uk.val[0], ur), vsubq_f64(uk.val[1], ui)}};
+        float64x2x2_t x1 = {{vaddq_f64(u2.val[0], di), vsubq_f64(u2.val[1], dr)}};
+        float64x2x2_t x3 = {{vsubq_f64(u2.val[0], di), vaddq_f64(u2.val[1], dr)}};
+        vst2q_f64(z + 2 * k, x0);
+        vst2q_f64(z + 2 * (k + n2), x2);
+        vst2q_f64(z + 2 * (k + n4), x1);
+        vst2q_f64(z + 2 * (k + n2 + n4), x3);
+    }
+#elif NOTORIOUS_FFT_HAS_AVX2 && !defined(NOTORIOUS_FFT_SINGLE)
+    for (; k + 2 <= n4; k += 2) {
+        __m256d w1r = _mm256_set_pd(ep[4 * (k + 1)], ep[4 * (k + 1)], ep[4 * k], ep[4 * k]);
+        __m256d w1i = _mm256_set_pd(ep[4 * (k + 1) + 1], ep[4 * (k + 1) + 1], ep[4 * k + 1], ep[4 * k + 1]);
+        __m256d w3r = _mm256_set_pd(ep[4 * (k + 1) + 2], ep[4 * (k + 1) + 2], ep[4 * k + 2], ep[4 * k + 2]);
+        __m256d w3i = _mm256_set_pd(ep[4 * (k + 1) + 3], ep[4 * (k + 1) + 3], ep[4 * k + 3], ep[4 * k + 3]);
+        __m256d uk = _mm256_loadu_pd(z + 2 * k);
+        __m256d u2 = _mm256_loadu_pd(z + 2 * (k + n4));
+        __m256d vv = _mm256_loadu_pd(z + 2 * (k + n2));
+        __m256d ww = _mm256_loadu_pd(z + 2 * (k + n2 + n4));
+        __m256d cmul = _mm256_set_pd(1.0, -1.0, 1.0, -1.0);
+        __m256d t2 = _mm256_fmadd_pd(_mm256_mul_pd(_mm256_shuffle_pd(vv, vv, 0x5), w1i), cmul,
+                                     _mm256_mul_pd(vv, w1r));
+        __m256d t3 = _mm256_fmadd_pd(_mm256_mul_pd(_mm256_shuffle_pd(ww, ww, 0x5), w3i), cmul,
+                                     _mm256_mul_pd(ww, w3r));
+        __m256d u = _mm256_add_pd(t2, t3);
+        __m256d d = _mm256_sub_pd(t2, t3);
+        _mm256_storeu_pd(z + 2 * k, _mm256_add_pd(uk, u));
+        _mm256_storeu_pd(z + 2 * (k + n2), _mm256_sub_pd(uk, u));
+        /* −i d on interleaved {re,im}: {di, −dr} */
+        __m256d dswap = _mm256_shuffle_pd(d, d, 0x5);
+        __m256d minus_i_d = _mm256_mul_pd(dswap, _mm256_set_pd(-1.0, 1.0, -1.0, 1.0));
+        _mm256_storeu_pd(z + 2 * (k + n4), _mm256_add_pd(u2, minus_i_d));
+        _mm256_storeu_pd(z + 2 * (k + n2 + n4), _mm256_sub_pd(u2, minus_i_d));
+    }
+#endif
+    for (; k < n4; k++)
+        notorious_fft_dit_combine1(z, k, n4, n2, ep[4 * k], ep[4 * k + 1],
+                                   ep[4 * k + 2], ep[4 * k + 3], 0);
+}
+
+static void notorious_fft_sr_inv_dit_cx(int N, notorious_fft_real* z, const notorious_fft_real* e)
+{
+    if (N == 1)
+        return;
+    if (N == 2) {
+        notorious_fft_real t0r = z[0] + z[2], t0i = z[1] + z[3];
+        notorious_fft_real t1r = z[0] - z[2], t1i = z[1] - z[3];
+        z[0] = t0r; z[1] = t0i; z[2] = t1r; z[3] = t1i;
+        return;
+    }
+    if (N == 4) {
+        notorious_fft_real t0r = z[0] + z[2], t0i = z[1] + z[3];
+        notorious_fft_real t1r = z[0] - z[2], t1i = z[1] - z[3];
+        notorious_fft_real vr = z[4], vi = z[5], wr = z[6], wi = z[7];
+        notorious_fft_real ur = vr + wr, ui = vi + wi;
+        notorious_fft_real dr = vr - wr, di = vi - wi;
+        z[0] = t0r + ur; z[1] = t0i + ui;
+        z[4] = t0r - ur; z[5] = t0i - ui;
+        z[2] = t1r - di; z[3] = t1i + dr; /* U1 + i d */
+        z[6] = t1r + di; z[7] = t1i - dr; /* U1 − i d */
+        return;
+    }
+    if (N == 8) {
+        const notorious_fft_real c8 = NOTORIOUS_FFT_INV_SQRT2;
+        notorious_fft_sr_inv_dit_cx(4, z, e);
+        notorious_fft_sr_inv_dit_cx(2, z + 8, e);
+        notorious_fft_sr_inv_dit_cx(2, z + 12, e);
+        notorious_fft_dit_combine1(z, 0, 2, 4, 1, 0, 1, 0, 1);
+        notorious_fft_dit_combine1(z, 1, 2, 4, c8, -c8, -c8, -c8, 1);
+        return;
+    }
+    if (N == 16) {
+        const notorious_fft_real c8 = NOTORIOUS_FFT_INV_SQRT2;
+        const notorious_fft_real c1 = (notorious_fft_real)0.923879532511286756128183189396788287;
+        const notorious_fft_real s1 = (notorious_fft_real)0.382683432365089771728459984030398867;
+        notorious_fft_sr_inv_dit_cx(8, z, e);
+        notorious_fft_sr_inv_dit_cx(4, z + 16, e);
+        notorious_fft_sr_inv_dit_cx(4, z + 24, e);
+        notorious_fft_dit_combine1(z, 0, 4, 8, 1, 0, 1, 0, 1);
+        notorious_fft_dit_combine1(z, 1, 4, 8, c1, -s1, s1, -c1, 1);
+        notorious_fft_dit_combine1(z, 2, 4, 8, c8, -c8, -c8, -c8, 1);
+        notorious_fft_dit_combine1(z, 3, 4, 8, s1, -c1, -c1, s1, 1);
+        return;
+    }
+
+    const notorious_fft_real* e_next = e + N;
+    notorious_fft_sr_inv_dit_cx(N / 2, z, e_next);
+    notorious_fft_sr_inv_dit_cx(N / 4, z + N, e_next + N / 2);
+    notorious_fft_sr_inv_dit_cx(N / 4, z + 3 * (N / 2), e_next + N / 2);
+
+    int n4 = N / 4, n2 = N / 2;
+    const notorious_fft_real* ep = e;
+    int k = 0;
+
+#if NOTORIOUS_FFT_HAS_NEON && !defined(NOTORIOUS_FFT_SINGLE)
+    for (; k + 2 <= n4; k += 2) {
+        float64x2_t w1r = (float64x2_t){ep[4 * k], ep[4 * (k + 1)]};
+        float64x2_t w1i = (float64x2_t){ep[4 * k + 1], ep[4 * (k + 1) + 1]};
+        float64x2_t w3r = (float64x2_t){ep[4 * k + 2], ep[4 * (k + 1) + 2]};
+        float64x2_t w3i = (float64x2_t){ep[4 * k + 3], ep[4 * (k + 1) + 3]};
+        float64x2x2_t uk = vld2q_f64(z + 2 * k);
+        float64x2x2_t u2 = vld2q_f64(z + 2 * (k + n4));
+        float64x2x2_t vv = vld2q_f64(z + 2 * (k + n2));
+        float64x2x2_t ww = vld2q_f64(z + 2 * (k + n2 + n4));
+        /* conj(w): re = vr*wr + vi*wi, im = vi*wr − vr*wi */
+        float64x2_t t2r = vaddq_f64(vmulq_f64(vv.val[0], w1r), vmulq_f64(vv.val[1], w1i));
+        float64x2_t t2i = vsubq_f64(vmulq_f64(vv.val[1], w1r), vmulq_f64(vv.val[0], w1i));
+        float64x2_t t3r = vaddq_f64(vmulq_f64(ww.val[0], w3r), vmulq_f64(ww.val[1], w3i));
+        float64x2_t t3i = vsubq_f64(vmulq_f64(ww.val[1], w3r), vmulq_f64(ww.val[0], w3i));
+        float64x2_t ur = vaddq_f64(t2r, t3r), ui = vaddq_f64(t2i, t3i);
+        float64x2_t dr = vsubq_f64(t2r, t3r), di = vsubq_f64(t2i, t3i);
+        float64x2x2_t x0 = {{vaddq_f64(uk.val[0], ur), vaddq_f64(uk.val[1], ui)}};
+        float64x2x2_t x2 = {{vsubq_f64(uk.val[0], ur), vsubq_f64(uk.val[1], ui)}};
+        float64x2x2_t x1 = {{vsubq_f64(u2.val[0], di), vaddq_f64(u2.val[1], dr)}};
+        float64x2x2_t x3 = {{vaddq_f64(u2.val[0], di), vsubq_f64(u2.val[1], dr)}};
+        vst2q_f64(z + 2 * k, x0);
+        vst2q_f64(z + 2 * (k + n2), x2);
+        vst2q_f64(z + 2 * (k + n4), x1);
+        vst2q_f64(z + 2 * (k + n2 + n4), x3);
+    }
+#elif NOTORIOUS_FFT_HAS_AVX2 && !defined(NOTORIOUS_FFT_SINGLE)
+    for (; k + 2 <= n4; k += 2) {
+        __m256d w1r = _mm256_set_pd(ep[4 * (k + 1)], ep[4 * (k + 1)], ep[4 * k], ep[4 * k]);
+        __m256d w1i = _mm256_set_pd(ep[4 * (k + 1) + 1], ep[4 * (k + 1) + 1], ep[4 * k + 1], ep[4 * k + 1]);
+        __m256d w3r = _mm256_set_pd(ep[4 * (k + 1) + 2], ep[4 * (k + 1) + 2], ep[4 * k + 2], ep[4 * k + 2]);
+        __m256d w3i = _mm256_set_pd(ep[4 * (k + 1) + 3], ep[4 * (k + 1) + 3], ep[4 * k + 3], ep[4 * k + 3]);
+        __m256d uk = _mm256_loadu_pd(z + 2 * k);
+        __m256d u2 = _mm256_loadu_pd(z + 2 * (k + n4));
+        __m256d vv = _mm256_loadu_pd(z + 2 * (k + n2));
+        __m256d ww = _mm256_loadu_pd(z + 2 * (k + n2 + n4));
+        __m256d cmul = _mm256_set_pd(-1.0, 1.0, -1.0, 1.0); /* conj multiply */
+        __m256d t2 = _mm256_fmadd_pd(_mm256_mul_pd(_mm256_shuffle_pd(vv, vv, 0x5), w1i), cmul,
+                                     _mm256_mul_pd(vv, w1r));
+        __m256d t3 = _mm256_fmadd_pd(_mm256_mul_pd(_mm256_shuffle_pd(ww, ww, 0x5), w3i), cmul,
+                                     _mm256_mul_pd(ww, w3r));
+        __m256d u = _mm256_add_pd(t2, t3);
+        __m256d d = _mm256_sub_pd(t2, t3);
+        _mm256_storeu_pd(z + 2 * k, _mm256_add_pd(uk, u));
+        _mm256_storeu_pd(z + 2 * (k + n2), _mm256_sub_pd(uk, u));
+        /* +i d: {−di, dr} */
+        __m256d dswap = _mm256_shuffle_pd(d, d, 0x5);
+        __m256d plus_i_d = _mm256_mul_pd(dswap, _mm256_set_pd(1.0, -1.0, 1.0, -1.0));
+        _mm256_storeu_pd(z + 2 * (k + n4), _mm256_add_pd(u2, plus_i_d));
+        _mm256_storeu_pd(z + 2 * (k + n2 + n4), _mm256_sub_pd(u2, plus_i_d));
+    }
+#endif
+    for (; k < n4; k++)
+        notorious_fft_dit_combine1(z, k, n4, n2, ep[4 * k], ep[4 * k + 1],
+                                   ep[4 * k + 2], ep[4 * k + 3], 1);
+}
+
+static void notorious_fft_execute_sr_dit(
+    const notorious_fft_plan* plan,
+    const notorious_fft_real* x_in,
+    notorious_fft_real* y_out,
+    int inverse)
+{
+    int N = (int)plan->n;
+    const int* rev = plan->bitrev;
+    notorious_fft_real* z = (x_in == y_out) ? plan->work_re : y_out;
+    for (int i = 0; i < N; i++) {
+        int j = rev[i];
+        z[2 * i]     = x_in[2 * j];
+        z[2 * i + 1] = x_in[2 * j + 1];
+    }
+    if (inverse)
+        notorious_fft_sr_inv_dit_cx(N, z, plan->sr_e);
+    else
+        notorious_fft_sr_dit_cx(N, z, plan->sr_e);
+    if (z != y_out)
+        memcpy(y_out, z, 2 * (size_t)N * sizeof(notorious_fft_real));
+}
+
+/* Mixed-radix Cooley–Tukey, N = r × m, r ∈ {3,5}.
+ * n = n1 + r n2,  k = m k1 + k2
+ * 1) gather x[n1 + r n2] → tmp[n1 m + n2]
+ * 2) m-point FFT of each n1-row
+ * 3) twiddle tmp[n1 m + k2] *= W_N^{n1 k2}
+ * 4) r-point DFT across n1 for each k2
+ * 5) tmp[k1 m + k2] is X[m k1 + k2] */
+static void notorious_fft_execute_mixed_cx(const notorious_fft_plan* plan,
+    const notorious_fft_real* x_in, notorious_fft_real* y_out, int inverse)
+{
+    const int r = plan->mixed_radix;
+    const int n = (int)plan->n;
+    const int m = n / r;
+    notorious_fft_plan* sub = plan->mixed_sub;
+    if (!sub || (r != 3 && r != 5 && r != 7) || m < 1 || !plan->sr_t) return;
+
+    notorious_fft_real* tmp = plan->sr_t;
+    for (int n1 = 0; n1 < r; n1++) {
+        for (int n2 = 0; n2 < m; n2++) {
+            size_t src = (size_t)(n1 + r * n2) * 2;
+            size_t dst = (size_t)(n1 * m + n2) * 2;
+            tmp[dst]     = x_in[src];
+            tmp[dst + 1] = x_in[src + 1];
+        }
+    }
+
+    for (int n1 = 0; n1 < r; n1++)
+        notorious_fft_execute_cx(sub, tmp + (size_t)n1 * m * 2,
+                                 tmp + (size_t)n1 * m * 2, inverse);
+
+    const notorious_fft_real* tw_re = plan->tw_re;
+    const notorious_fft_real* tw_im = plan->tw_im;
+    if (tw_re && tw_im) {
+        for (int n1 = 1; n1 < r; n1++) {
+            for (int k2 = 0; k2 < m; k2++) {
+                size_t ti = (size_t)(n1 - 1) * (size_t)m + (size_t)k2;
+                size_t oi = ((size_t)n1 * (size_t)m + (size_t)k2) * 2;
+                notorious_fft_real wr = tw_re[ti];
+                notorious_fft_real wi = inverse ? -tw_im[ti] : tw_im[ti];
+                notorious_fft_real ur = tmp[oi], ui = tmp[oi + 1];
+                tmp[oi]     = ur * wr - ui * wi;
+                tmp[oi + 1] = ur * wi + ui * wr;
+            }
+        }
+    }
+
+    for (int k2 = 0; k2 < m; k2++) {
+        if (r == 3)
+            notorious_fft_radix3_stride(tmp + 2 * k2, m, inverse);
+        else if (r == 5)
+            notorious_fft_radix5_stride(tmp + 2 * k2, m, inverse);
+        else
+            notorious_fft_radix7_stride(tmp + 2 * k2, m, inverse);
+    }
+
+    if (y_out != tmp)
+        memcpy(y_out, tmp, (size_t)n * 2 * sizeof(notorious_fft_real));
+}
+
+/* Rader: prime-N DFT as cyclic convolution of length N−1.
+ * a[p] = x[g^p], b[p] = ω^{g^{-p}}, y[g^{-q}] = x[0] + (a ∗ b)[q],
+ * y[0] = Σ x. Inner FFT is unnormalized, so IFFT is scaled by 1/(N−1). */
+static void notorious_fft_execute_rader_cx(const notorious_fft_plan* plan,
+    const notorious_fft_real* x_in, notorious_fft_real* y_out)
+{
+    const size_t n = plan->n;
+    const size_t m = n - 1;
+    notorious_fft_real* a = plan->sr_t;
+    const int* in_idx = plan->rader_in;
+    const int* out_idx = plan->rader_out;
+    if (!a || !in_idx || !out_idx || !plan->rader_sub || !plan->rader_b_re) return;
+
+    notorious_fft_real x0r = x_in[0], x0i = x_in[1];
+    notorious_fft_real dcr = 0, dci = 0;
+    for (size_t i = 0; i < n; i++) {
+        dcr += x_in[2 * i];
+        dci += x_in[2 * i + 1];
+    }
+    for (size_t j = 0; j < m; j++) {
+        size_t s = (size_t)in_idx[j] * 2;
+        a[2 * j]     = x_in[s];
+        a[2 * j + 1] = x_in[s + 1];
+    }
+
+    notorious_fft_execute_cx(plan->rader_sub, a, a, 0);
+
+    const notorious_fft_real* br = plan->rader_b_re;
+    const notorious_fft_real* bi = plan->rader_b_im;
+    for (size_t j = 0; j < m; j++) {
+        notorious_fft_real ar = a[2 * j], ai = a[2 * j + 1];
+        a[2 * j]     = ar * br[j] - ai * bi[j];
+        a[2 * j + 1] = ar * bi[j] + ai * br[j];
+    }
+
+    notorious_fft_execute_cx(plan->rader_sub, a, a, 1);
+
+    notorious_fft_real scale = (notorious_fft_real)1.0 / (notorious_fft_real)m;
+    y_out[0] = dcr;
+    y_out[1] = dci;
+    for (size_t j = 0; j < m; j++) {
+        size_t d = (size_t)out_idx[j] * 2;
+        y_out[d]     = x0r + a[2 * j] * scale;
+        y_out[d + 1] = x0i + a[2 * j + 1] * scale;
+    }
+}
+
+/* Row-major complex transpose: src[i*cols+j] -> dst[j*rows+i] */
+static void notorious_fft_transpose_rm(
+    const notorious_fft_real* src, notorious_fft_real* dst, int rows, int cols)
+{
+    const int TS = 16;
+    for (int i0 = 0; i0 < rows; i0 += TS) {
+        int i1 = i0 + TS < rows ? i0 + TS : rows;
+        for (int j0 = 0; j0 < cols; j0 += TS) {
+            int j1 = j0 + TS < cols ? j0 + TS : cols;
+            for (int i = i0; i < i1; i++) {
+                for (int j = j0; j < j1; j++) {
+                    size_t s = ((size_t)i * (size_t)cols + (size_t)j) * 2;
+                    size_t d = ((size_t)j * (size_t)rows + (size_t)i) * 2;
+                    dst[d]     = src[s];
+                    dst[d + 1] = src[s + 1];
+                }
+            }
+        }
+    }
+}
+
+/* Four-step / six-step Cooley–Tukey: N = n1 × n2.
+ * n = n1_idx + n1 n2_idx,  k = n2 k1 + k2
+ * tmp[p,q] = x[p + n1 q] → FFT_n2 along q → twiddle W^{p q} → FFT_n1 along p. */
+static void notorious_fft_execute_four_step(const notorious_fft_plan* plan,
+    const notorious_fft_real* x_in, notorious_fft_real* y_out, int inverse)
+{
+    const int n1 = plan->four_n1;
+    const int n2 = plan->four_n2;
+    notorious_fft_plan* s1 = plan->four_sub1;
+    notorious_fft_plan* s2 = plan->four_sub2 ? plan->four_sub2 : plan->four_sub1;
+    if (!s1 || !s2 || n1 < 1 || n2 < 1 || !plan->sr_t || !plan->work_re) return;
+
+    notorious_fft_real* tmp = plan->sr_t;
+    notorious_fft_real* work = plan->work_re;
+
+    /* x[q*n1+p] -> tmp[p*n2+q] */
+    notorious_fft_transpose_rm(x_in, tmp, n2, n1);
+
+    for (int p = 0; p < n1; p++)
+        notorious_fft_execute_cx(s2, tmp + (size_t)p * n2 * 2,
+                                 tmp + (size_t)p * n2 * 2, inverse);
+
+    const notorious_fft_real* tw_re = plan->four_tw_re;
+    const notorious_fft_real* tw_im = plan->four_tw_im;
+    if (tw_re && tw_im) {
+        for (int p = 0; p < n1; p++) {
+            for (int q = 0; q < n2; q++) {
+                size_t i = (size_t)p * (size_t)n2 + (size_t)q;
+                /* stored at plan as q*n1+p; map to p*n2+q */
+                size_t ti = (size_t)q * (size_t)n1 + (size_t)p;
+                notorious_fft_real wr = tw_re[ti];
+                notorious_fft_real wi = inverse ? -tw_im[ti] : tw_im[ti];
+                notorious_fft_real ur = tmp[2 * i], ui = tmp[2 * i + 1];
+                tmp[2 * i]     = ur * wr - ui * wi;
+                tmp[2 * i + 1] = ur * wi + ui * wr;
+            }
+        }
+    }
+
+    /* tmp[p*n2+q] -> work[q*n1+p] */
+    notorious_fft_transpose_rm(tmp, work, n1, n2);
+
+    for (int q = 0; q < n2; q++)
+        notorious_fft_execute_cx(s1, work + (size_t)q * n1 * 2,
+                                 work + (size_t)q * n1 * 2, inverse);
+
+    /* work[q*n1+p] -> y[p*n2+q] = X[k1*n2 + k2] */
+    notorious_fft_transpose_rm(work, y_out, n2, n1);
 }
 
 /* ============================================================================
@@ -1803,48 +2836,9 @@ static void notorious_fft_execute_bluestein(
 
     size_t n = plan->n;
     size_t m = plan->bluestein_n;
-    
-    /* For inverse DFT, use the property: IDFT(X) = (1/N) * conj(DFT(conj(X)))
-     * This lets us use the same forward Bluestein algorithm for inverse. */
-    if (plan->is_inverse) {
-        /* Use bluestein buffers for temporary storage */
-        notorious_fft_real* x_conj_re = plan->bluestein_buf_re;
-        notorious_fft_real* x_conj_im = plan->bluestein_buf_im;
-        
-        /* Compute conj(X) */
-#if NOTORIOUS_FFT_HAS_OPENMP
-        #pragma omp parallel for schedule(static) if(n > 1024)
-#endif
-        for (size_t i = 0; i < n; i++) {
-            x_conj_re[i] = xr_in[i];
-            x_conj_im[i] = -xi_in[i];
-        }
-        
-        /* Apply forward Bluestein to conj(X) */
-        /* First save original is_inverse flag and set to forward */
-        int saved_inverse = plan->is_inverse;
-        ((notorious_fft_plan*)plan)->is_inverse = 0;
-        
-        notorious_fft_execute_bluestein(plan, x_conj_re, x_conj_im, xr_out, xi_out);
-        
-        /* Restore inverse flag */
-        ((notorious_fft_plan*)plan)->is_inverse = saved_inverse;
-        
-        /* Take conj(y) and scale by 1/N: IDFT(X) = conj(y) / N */
-#if NOTORIOUS_FFT_HAS_OPENMP
-        #pragma omp parallel for schedule(static) if(n > 1024)
-#endif
-        for (size_t i = 0; i < n; i++) {
-            notorious_fft_real tmp_re = xr_out[i] / (notorious_fft_real)n;
-            notorious_fft_real tmp_im = -xi_out[i] / (notorious_fft_real)n;
-            xr_out[i] = tmp_re;
-            xi_out[i] = tmp_im;
-        }
-        
-        return;
-    }
-    
-    /* Forward Bluestein algorithm */
+
+    /* Forward Bluestein only. Inverse is the unnormalized conjugate identity
+     * applied by notorious_fft_execute_cx; this function never mutates the plan. */
     
     /* chirp_re/im contains the original chirp factors exp(-i*pi*k^2/n) for pre/post multiply */
     const notorious_fft_real* chirp_re = plan->bluestein_chirp_re;
@@ -1958,6 +2952,9 @@ static void notorious_fft_execute_bluestein(
 
 /* Forward declarations */
 static notorious_fft_plan* notorious_fft_create_plan_power2(size_t n);
+static notorious_fft_plan* notorious_fft_create_plan_mixed(size_t n);
+static notorious_fft_plan* notorious_fft_create_plan_rader(size_t n);
+static notorious_fft_plan* notorious_fft_create_plan(size_t n, int inverse);
 static void notorious_fft_destroy_plan(notorious_fft_plan* plan);
 
 /* ============================================================================
@@ -1976,10 +2973,11 @@ static void notorious_fft_destroy_plan(notorious_fft_plan* plan);
 
 static notorious_fft_plan* notorious_fft_create_plan_bluestein(size_t n, int inverse) {
     if (n == 0) return NULL;
+    /* 2n-1 must fit in size_t; convolution pad is the next power of two. */
+    if (n > (SIZE_MAX - 1) / 2) return NULL;
 
-    /* Next power of 2 >= 2*n-1 */
-    size_t m = 1;
-    while (m < 2 * n - 1) m <<= 1;
+    size_t m = notorious_fft_next_pow2(2 * n - 1);
+    if (m == 0) return NULL;
 
     /* Slab layout (high→low, allocated by decrementing bump pointer):
      *
@@ -2037,8 +3035,8 @@ static notorious_fft_plan* notorious_fft_create_plan_bluestein(size_t n, int inv
     }
 
     /* Create filter h[n] = exp(πin²/N) for n = -(N-1)..(N-1) in work buffers */
-    for (size_t k = 0; k <= 2*(n-1); k++) {
-        int idx = (int)k - (int)(n - 1);
+    for (size_t k = 0; k <= 2 * (n - 1); k++) {
+        int64_t idx = (int64_t)k - (int64_t)(n - 1);
         notorious_fft_real angle = NOTORIOUS_FFT_PI * (notorious_fft_real)idx * (notorious_fft_real)idx / (notorious_fft_real)n;
         plan->work_re[k] = notorious_fft_cos(angle);
         plan->work_im[k] = notorious_fft_sin(angle);
@@ -2110,6 +3108,8 @@ static notorious_fft_plan* notorious_fft_create_plan_power2(size_t n) {
               + NOTORIOUS_FFT_SLAB_FIELD((n / 2) * real_bytes) * 2
               + NOTORIOUS_FFT_SLAB_FIELD(2 * n * real_bytes)     /* work_re (2n, work_im aliased) */
               + NOTORIOUS_FFT_SLAB_FIELD(2 * n * real_bytes) * 2;/* sr_e, sr_t */
+        if (n >= (size_t)NOTORIOUS_FFT_FOURSTEP_MIN)
+            total += NOTORIOUS_FFT_SLAB_FIELD(n * real_bytes) * 2; /* four-step twiddles */
         total = NOTORIOUS_FFT_BUMP_ROUND(total);
     }
 
@@ -2140,6 +3140,10 @@ static notorious_fft_plan* notorious_fft_create_plan_power2(size_t n) {
             plan->tw_im[i] = notorious_fft_sin(angle);
         }
     } else {
+        if (n >= (size_t)NOTORIOUS_FFT_FOURSTEP_MIN) {
+            plan->four_tw_im = (notorious_fft_real*)notorious_fft_bump_alloc(&bump, n * real_bytes);
+            plan->four_tw_re = (notorious_fft_real*)notorious_fft_bump_alloc(&bump, n * real_bytes);
+        }
         plan->sr_t     = (notorious_fft_real*)notorious_fft_bump_alloc(&bump, 2 * n * real_bytes);
         plan->sr_e     = (notorious_fft_real*)notorious_fft_bump_alloc(&bump, 2 * n * real_bytes);
         plan->work_re  = (notorious_fft_real*)notorious_fft_bump_alloc(&bump, 2 * n * real_bytes);
@@ -2169,6 +3173,36 @@ static notorious_fft_plan* notorious_fft_create_plan_power2(size_t n) {
             }
             sz >>= 1;
         }
+
+        if (n >= (size_t)NOTORIOUS_FFT_FOURSTEP_MIN && plan->four_tw_re) {
+            int lg = 0;
+            for (size_t t = n; t > 1; t >>= 1) lg++;
+            int n1 = 1 << (lg / 2);
+            int n2 = (int)(n / (size_t)n1);
+            plan->four_n1 = n1;
+            plan->four_n2 = n2;
+            plan->four_sub1 = notorious_fft_create_plan_power2((size_t)n1);
+            if (!plan->four_sub1) {
+                notorious_fft_destroy_plan(plan);
+                return NULL;
+            }
+            if (n2 != n1) {
+                plan->four_sub2 = notorious_fft_create_plan_power2((size_t)n2);
+                if (!plan->four_sub2) {
+                    notorious_fft_destroy_plan(plan);
+                    return NULL;
+                }
+            }
+            for (int q = 0; q < n2; q++) {
+                for (int p = 0; p < n1; p++) {
+                    size_t i = (size_t)q * (size_t)n1 + (size_t)p;
+                    notorious_fft_real angle = -NOTORIOUS_FFT_2PI * (notorious_fft_real)p * (notorious_fft_real)q
+                                               / (notorious_fft_real)n;
+                    plan->four_tw_re[i] = notorious_fft_cos(angle);
+                    plan->four_tw_im[i] = notorious_fft_sin(angle);
+                }
+            }
+        }
     }
 
     return plan;
@@ -2178,19 +3212,203 @@ static notorious_fft_plan* notorious_fft_create_plan_power2(size_t n) {
  * Main Plan API
  * ============================================================================ */
 
+static notorious_fft_plan* notorious_fft_create_plan_mixed(size_t n) {
+    int radix = (n % 7u == 0) ? 7 : (n % 5u == 0) ? 5 : 3;
+    if (n % (size_t)radix != 0) return NULL;
+    size_t m = n / (size_t)radix;
+
+    notorious_fft_plan* sub = notorious_fft_create_plan(m, 0);
+    if (!sub) return NULL;
+
+    size_t tw_count = (size_t)(radix - 1) * m;
+    size_t real_bytes = sizeof(notorious_fft_real);
+    size_t total = NOTORIOUS_FFT_SLAB_FIELD(sizeof(notorious_fft_plan))
+                 + NOTORIOUS_FFT_SLAB_FIELD(2 * n * real_bytes)          /* sr_t work */
+                 + NOTORIOUS_FFT_SLAB_FIELD(tw_count * real_bytes) * 2;  /* tw_re, tw_im */
+    total = NOTORIOUS_FFT_BUMP_ROUND(total);
+
+    void* slab = notorious_fft_malloc(total);
+    if (!slab) {
+        notorious_fft_destroy_plan(sub);
+        return NULL;
+    }
+
+    notorious_fft_plan* plan = (notorious_fft_plan*)slab;
+    memset(plan, 0, sizeof(*plan));
+    plan->slab = slab;
+    plan->n = n;
+    plan->mixed_radix = radix;
+    plan->mixed_sub = sub;
+
+    char* bump = (char*)slab + total;
+    plan->tw_im = (notorious_fft_real*)notorious_fft_bump_alloc(&bump, tw_count * real_bytes);
+    plan->tw_re = (notorious_fft_real*)notorious_fft_bump_alloc(&bump, tw_count * real_bytes);
+    plan->sr_t  = (notorious_fft_real*)notorious_fft_bump_alloc(&bump, 2 * n * real_bytes);
+
+    for (int n1 = 1; n1 < radix; n1++) {
+        for (size_t k = 0; k < m; k++) {
+            size_t ti = (size_t)(n1 - 1) * m + k;
+            notorious_fft_real angle = -NOTORIOUS_FFT_2PI * (notorious_fft_real)n1 * (notorious_fft_real)k
+                                       / (notorious_fft_real)n;
+            plan->tw_re[ti] = notorious_fft_cos(angle);
+            plan->tw_im[ti] = notorious_fft_sin(angle);
+        }
+    }
+    return plan;
+}
+
+static notorious_fft_plan* notorious_fft_create_plan_rader(size_t n) {
+    /* Prime N, (N−1) 2·3·5·7-smooth → (N−1)-point FFT instead of Bluestein ~2N.
+     * Mersenne N=2^p−1 is (n&(n+1))==0; do NOT pad a zero onto the 2^p path —
+     * that is a different DFT. Small Mersenne primes (3,7,31,127) have smooth N−1. */
+    if (n < 11 || n > (size_t)0x7fffffff) return NULL;
+    /* Mersenne N=2^p−1 is (n&(n+1))==0; still need primality (15, 63, 255
+     * are composite) and a smooth N−1. Do not pad onto the 2^p path. */
+    (void)notorious_fft_is_mersenne_number(n);
+    if (!notorious_fft_is_prime(n) || !notorious_fft_is_2357_smooth(n - 1))
+        return NULL;
+    size_t g = notorious_fft_primitive_root(n);
+    if (g == 0) return NULL;
+    size_t ginv = notorious_fft_modpow(g, n - 2, n);
+    if (ginv == 0) return NULL;
+    size_t m = n - 1;
+
+    notorious_fft_plan* sub = notorious_fft_create_plan(m, 0);
+    if (!sub) return NULL;
+
+    size_t real_bytes = sizeof(notorious_fft_real);
+    size_t int_bytes = sizeof(int);
+    size_t total = NOTORIOUS_FFT_SLAB_FIELD(sizeof(notorious_fft_plan))
+                 + NOTORIOUS_FFT_SLAB_FIELD(m * int_bytes) * 2
+                 + NOTORIOUS_FFT_SLAB_FIELD(m * real_bytes) * 2
+                 + NOTORIOUS_FFT_SLAB_FIELD(2 * n * real_bytes);
+    total = NOTORIOUS_FFT_BUMP_ROUND(total);
+
+    void* slab = notorious_fft_malloc(total);
+    if (!slab) {
+        notorious_fft_destroy_plan(sub);
+        return NULL;
+    }
+
+    notorious_fft_plan* plan = (notorious_fft_plan*)slab;
+    memset(plan, 0, sizeof(*plan));
+    plan->slab = slab;
+    plan->n = n;
+    plan->rader_sub = sub;
+
+    char* bump = (char*)slab + total;
+    plan->sr_t      = (notorious_fft_real*)notorious_fft_bump_alloc(&bump, 2 * n * real_bytes);
+    plan->rader_b_im = (notorious_fft_real*)notorious_fft_bump_alloc(&bump, m * real_bytes);
+    plan->rader_b_re = (notorious_fft_real*)notorious_fft_bump_alloc(&bump, m * real_bytes);
+    plan->rader_out = (int*)notorious_fft_bump_alloc(&bump, m * int_bytes);
+    plan->rader_in  = (int*)notorious_fft_bump_alloc(&bump, m * int_bytes);
+
+    size_t p = 1, q = 1;
+    for (size_t j = 0; j < m; j++) {
+        plan->rader_in[j]  = (int)p;
+        plan->rader_out[j] = (int)q;
+        p = (size_t)(((uint64_t)p * (uint64_t)g) % (uint64_t)n);
+        q = (size_t)(((uint64_t)q * (uint64_t)ginv) % (uint64_t)n);
+    }
+
+    for (size_t j = 0; j < m; j++) {
+        notorious_fft_real angle = -NOTORIOUS_FFT_2PI
+            * (notorious_fft_real)plan->rader_out[j] / (notorious_fft_real)n;
+        plan->sr_t[2 * j]     = notorious_fft_cos(angle);
+        plan->sr_t[2 * j + 1] = notorious_fft_sin(angle);
+    }
+    notorious_fft_execute_cx(sub, plan->sr_t, plan->sr_t, 0);
+    for (size_t j = 0; j < m; j++) {
+        plan->rader_b_re[j] = plan->sr_t[2 * j];
+        plan->rader_b_im[j] = plan->sr_t[2 * j + 1];
+    }
+    return plan;
+}
+
 static notorious_fft_plan* notorious_fft_create_plan(size_t n, int inverse) {
     if (n == 0) return NULL;
     if ((n & (n - 1)) == 0)
         return notorious_fft_create_plan_power2(n);
+    /* Peel 3/5/7 even when the cofactor is prime (Rader) or awkward (Bluestein). */
+    if (n % 7u == 0 || n % 5u == 0 || n % 3u == 0) {
+        notorious_fft_plan* p = notorious_fft_create_plan_mixed(n);
+        if (p) return p;
+    }
+    if (n >= 11 && notorious_fft_is_prime(n) && notorious_fft_is_2357_smooth(n - 1)) {
+        notorious_fft_plan* p = notorious_fft_create_plan_rader(n);
+        if (p) return p;
+    }
     return notorious_fft_create_plan_bluestein(n, inverse);
+}
+
+static void notorious_fft_tune_plan(notorious_fft_plan* plan) {
+    if (!plan || !plan->sr_e || !plan->sr_t || !plan->bitrev || plan->n < 32)
+        return;
+    size_t n = plan->n;
+    size_t bytes = 2 * n * sizeof(notorious_fft_real);
+    notorious_fft_real* a = (notorious_fft_real*)notorious_fft_malloc(bytes);
+    notorious_fft_real* b = (notorious_fft_real*)notorious_fft_malloc(bytes);
+    if (!a || !b) {
+        notorious_fft_free(a);
+        notorious_fft_free(b);
+        return;
+    }
+    for (size_t i = 0; i < 2 * n; i++)
+        a[i] = (notorious_fft_real)((int)i * 0.017 + 0.3);
+
+    const int reps = n >= 4096 ? 3 : 8;
+    uint64_t dif_dt, dit_dt, it_dt, t0, t1;
+
+    memcpy(b, a, bytes);
+    t0 = notorious_fft_rdtsc();
+    for (int i = 0; i < reps; i++) {
+        memcpy(b, a, bytes);
+        notorious_fft_execute_sr_dif(plan, b, b, 0);
+    }
+    t1 = notorious_fft_rdtsc();
+    dif_dt = t1 - t0;
+
+    dit_dt = ~(uint64_t)0;
+    if (n >= 64) {
+        t0 = notorious_fft_rdtsc();
+        for (int i = 0; i < reps; i++) {
+            memcpy(b, a, bytes);
+            notorious_fft_execute_sr_dit(plan, b, b, 0);
+        }
+        t1 = notorious_fft_rdtsc();
+        dit_dt = t1 - t0;
+    }
+
+    t0 = notorious_fft_rdtsc();
+    for (int i = 0; i < reps; i++) {
+        memcpy(b, a, bytes);
+        notorious_fft_iterative_inplace_cx(b, plan->bitrev, plan->tw_re, plan->tw_im, n, 0);
+    }
+    t1 = notorious_fft_rdtsc();
+    it_dt = t1 - t0;
+
+    plan->prefer_iterative = 0;
+    plan->prefer_dit = 0;
+    if (it_dt < dif_dt && it_dt < dit_dt)
+        plan->prefer_iterative = 1;
+    else if (dit_dt < dif_dt)
+        plan->prefer_dit = 1;
+    notorious_fft_free(a);
+    notorious_fft_free(b);
 }
 
 static void notorious_fft_destroy_plan(notorious_fft_plan* plan) {
     if (!plan) return;
-    /* Bluestein inner plan owns its own slab */
+    if (plan->mixed_sub)
+        notorious_fft_destroy_plan(plan->mixed_sub);
+    if (plan->rader_sub)
+        notorious_fft_destroy_plan(plan->rader_sub);
+    if (plan->four_sub1)
+        notorious_fft_destroy_plan(plan->four_sub1);
+    if (plan->four_sub2 && plan->four_sub2 != plan->four_sub1)
+        notorious_fft_destroy_plan(plan->four_sub2);
     if (plan->bluestein_plan)
         notorious_fft_destroy_plan(plan->bluestein_plan);
-    /* Everything else is in the single slab — one free to rule them all */
     notorious_fft_free(plan->slab);
 }
 
@@ -2284,7 +3502,7 @@ static void notorious_fft_s_dft_1d(notorious_fft_cmpl* x, notorious_fft_cmpl* y,
     if (sy == 1) {
         notorious_fft_dft_1d_cx(x, y, N, plan, inverse);
     } else {
-        notorious_fft_cmpl* buf = (notorious_fft_cmpl*)malloc((size_t)N * sizeof(notorious_fft_cmpl));
+        notorious_fft_cmpl* buf = (notorious_fft_cmpl*)a->scratch_re;
         if (!buf) return;
         notorious_fft_dft_1d_cx(x, buf, N, plan, inverse);
         notorious_fft_real* br = (notorious_fft_real*)buf;
@@ -2293,7 +3511,6 @@ static void notorious_fft_s_dft_1d(notorious_fft_cmpl* x, notorious_fft_cmpl* y,
             yr[2 * i * sy]     = br[2 * i];
             yr[2 * i * sy + 1] = br[2 * i + 1];
         }
-        free(buf);
     }
 }
 
@@ -2305,6 +3522,7 @@ static void notorious_fft_s_dft_1d(notorious_fft_cmpl* x, notorious_fft_cmpl* y,
  *   direct 1D:    plan!=NULL (from mkaux_dft_1d called directly) */
 static void notorious_fft_mkcx(notorious_fft_cmpl* x, notorious_fft_cmpl* y, int sy,
                           const notorious_fft_aux* a, int inverse) {
+    if (!a || !x || !y) return;
     /* Direct 1D aux (plan set, no sub-structures) */
     if (a->plan) {
         notorious_fft_s_dft_1d(x, y, sy, a, inverse);
@@ -2341,10 +3559,12 @@ static void notorious_fft_mkcx(notorious_fft_cmpl* x, notorious_fft_cmpl* y, int
  * ============================================================================ */
 
 void notorious_fft_dft(notorious_fft_cmpl* x, notorious_fft_cmpl* y, const notorious_fft_aux* a) {
+    if (!a) return;
     notorious_fft_mkcx(x, y, 1, a, 0);
 }
 
 void notorious_fft_invdft(notorious_fft_cmpl* x, notorious_fft_cmpl* y, const notorious_fft_aux* a) {
+    if (!a) return;
     notorious_fft_mkcx(x, y, 1, a, 1);
 }
 
@@ -2357,6 +3577,28 @@ void notorious_fft_invdft(notorious_fft_cmpl* x, notorious_fft_cmpl* y, const no
  * ============================================================================ */
 
 void notorious_fft_realdft(notorious_fft_real* x, notorious_fft_cmpl* z, const notorious_fft_aux* a) {
+    if (!a || !x || !z) return;
+
+    /* Multi-dimensional: r2c on last dim, then complex DFT on the leading dims
+     * (FFTW packing: output is howmany × (n_last/2+1) complexes, row-major). */
+    if (a->sub1 && a->sub2 && !a->plan) {
+        int n_last = a->sub1->N;
+        int nc = n_last / 2 + 1;
+        int howmany = (n_last > 0) ? (a->N / n_last) : 0;
+        notorious_fft_cmpl *col = (notorious_fft_cmpl *)a->scratch_re;
+        if (howmany <= 0 || !col) return;
+        for (int i = 0; i < howmany; i++)
+            notorious_fft_realdft(x + i * n_last, z + i * nc, a->sub1);
+        for (int k = 0; k < nc; k++) {
+            for (int i = 0; i < howmany; i++)
+                memcpy(&col[i], &z[i * nc + k], sizeof(notorious_fft_cmpl));
+            notorious_fft_dft(col, col, a->sub2);
+            for (int i = 0; i < howmany; i++)
+                memcpy(&z[i * nc + k], &col[i], sizeof(notorious_fft_cmpl));
+        }
+        return;
+    }
+
     int N = a->N;
     if (N == 1) {
         ((notorious_fft_real*)z)[0] = x[0];
@@ -2434,6 +3676,26 @@ void notorious_fft_realdft(notorious_fft_real* x, notorious_fft_cmpl* z, const n
 }
 
 void notorious_fft_invrealdft(notorious_fft_cmpl* z, notorious_fft_real* y, const notorious_fft_aux* a) {
+    if (!a || !z || !y) return;
+
+    if (a->sub1 && a->sub2 && !a->plan) {
+        int n_last = a->sub1->N;
+        int nc = n_last / 2 + 1;
+        int howmany = (n_last > 0) ? (a->N / n_last) : 0;
+        notorious_fft_cmpl *col = (notorious_fft_cmpl *)a->scratch_re;
+        if (howmany <= 0 || !col) return;
+        for (int k = 0; k < nc; k++) {
+            for (int i = 0; i < howmany; i++)
+                memcpy(&col[i], &z[i * nc + k], sizeof(notorious_fft_cmpl));
+            notorious_fft_invdft(col, col, a->sub2);
+            for (int i = 0; i < howmany; i++)
+                memcpy(&z[i * nc + k], &col[i], sizeof(notorious_fft_cmpl));
+        }
+        for (int i = 0; i < howmany; i++)
+            notorious_fft_invrealdft(z + i * nc, y + i * n_last, a->sub1);
+        return;
+    }
+
     int N = a->N;
     if (N == 1) {
         y[0] = ((notorious_fft_real*)z)[0];
@@ -2942,6 +4204,33 @@ static NOTORIOUS_FFT_INLINE void notorious_fft_t4_postmul_avx2(
 
 #endif /* NOTORIOUS_FFT_HAS_AVX2 && !NOTORIOUS_FFT_SINGLE */
 
+/* Multi-dimensional real transform via preallocated a->t / scratch_re / scratch_im.
+ * No malloc at execute time. */
+static void notorious_fft_apply_mdrx(
+    notorious_fft_real* x, notorious_fft_real* y, const notorious_fft_aux* a,
+    void (*fn)(notorious_fft_real*, notorious_fft_real*, const notorious_fft_aux*))
+{
+    int N1 = a->sub1 ? a->sub1->N : 1;
+    int N2 = a->sub2->N;
+    if (N1 == 1) {
+        fn(x, y, a->sub2);
+        return;
+    }
+    notorious_fft_real* temp = (notorious_fft_real*)a->t;
+    notorious_fft_real* col_in = a->scratch_re;
+    notorious_fft_real* col_out = a->scratch_im;
+    if (!temp || !col_in || !col_out) return;
+    for (int n = 0; n < N2; n++)
+        fn(x + n * N1, temp + n * N1, a->sub1);
+    for (int n = 0; n < N1; n++) {
+        for (int i = 0; i < N2; i++)
+            col_in[i] = temp[n + i * N1];
+        fn(col_in, col_out, a->sub2);
+        for (int i = 0; i < N2; i++)
+            y[n + i * N1] = col_out[i];
+    }
+}
+
 /* ============================================================================
  * DCT/DST Type 2 — zero-malloc, precomputed twiddles
  *
@@ -2993,6 +4282,7 @@ static void notorious_fft_s_dct2_1d(notorious_fft_real* x, notorious_fft_real* y
 }
 
 void notorious_fft_dct2(notorious_fft_real* x, notorious_fft_real* y, const notorious_fft_aux* a) {
+    if (!a || !x || !y) return;
     if (a->plan) {
         int N = a->N;
 #if NOTORIOUS_FFT_HAS_AVX2 && !defined(NOTORIOUS_FFT_SINGLE)
@@ -3017,45 +4307,7 @@ void notorious_fft_dct2(notorious_fft_real* x, notorious_fft_real* y, const noto
 #endif
         notorious_fft_s_dct2_1d(x, y, a);
     } else if (a->sub2) {
-        /* Multi-dimensional: sub1 = higher dims, sub2 = current dim */
-        int N1 = a->sub1 ? a->sub1->N : 1;
-        int N2 = a->sub2->N;
-
-        if (N1 == 1) {
-            notorious_fft_dct2(x, y, a->sub2);
-            return;
-        }
-
-        int total = N1 * N2;
-        notorious_fft_real* temp = (notorious_fft_real*)malloc(total * sizeof(notorious_fft_real));
-        if (!temp) return;
-
-        /* Transform hyperplanes using sub1 — no OpenMP, shared plan buffers are not thread-safe */
-        for (int n = 0; n < N2; n++) {
-            if (a->sub1) {
-                notorious_fft_dct2(x + n * N1, temp + n * N1, a->sub1);
-            } else {
-                memcpy(temp + n * N1, x + n * N1, N1 * sizeof(notorious_fft_real));
-            }
-        }
-
-        /* Transform rows using sub2 — pre-allocate buffers once */
-        notorious_fft_real* col_in = (notorious_fft_real*)malloc(N2 * sizeof(notorious_fft_real));
-        notorious_fft_real* col_out = (notorious_fft_real*)malloc(N2 * sizeof(notorious_fft_real));
-        if (col_in && col_out) {
-            for (int n = 0; n < N1; n++) {
-                for (int k = 0; k < N2; k++) {
-                    col_in[k] = temp[n + k * N1];
-                }
-                notorious_fft_dct2(col_in, col_out, a->sub2);
-                for (int k = 0; k < N2; k++) {
-                    y[n + k * N1] = col_out[k];
-                }
-            }
-        }
-        free(col_in);
-        free(col_out);
-        free(temp);
+        notorious_fft_apply_mdrx(x, y, a, notorious_fft_dct2);
     } else {
         notorious_fft_s_dct2_1d(x, y, a);
     }
@@ -3092,6 +4344,7 @@ static void notorious_fft_s_dst2_1d(notorious_fft_real* x, notorious_fft_real* y
 }
 
 void notorious_fft_dst2(notorious_fft_real* x, notorious_fft_real* y, const notorious_fft_aux* a) {
+    if (!a || !x || !y) return;
     if (a->plan) {
         int N = a->N;
 #if NOTORIOUS_FFT_HAS_AVX2 && !defined(NOTORIOUS_FFT_SINGLE)
@@ -3122,25 +4375,7 @@ void notorious_fft_dst2(notorious_fft_real* x, notorious_fft_real* y, const noto
 #endif
         notorious_fft_s_dst2_1d(x, y, a);
     } else if (a->sub2) {
-        int N1 = a->sub1 ? a->sub1->N : 1;
-        int N2 = a->sub2->N;
-        if (N1 == 1) { notorious_fft_dst2(x, y, a->sub2); return; }
-        int total = N1 * N2;
-        notorious_fft_real* temp = (notorious_fft_real*)malloc((size_t)total * sizeof(notorious_fft_real));
-        if (!temp) return;
-        /* No OpenMP — shared plan buffers are not thread-safe */
-        for (int n = 0; n < N2; n++)
-            notorious_fft_dst2(x + n*N1, temp + n*N1, a->sub1);
-        notorious_fft_real* col = (notorious_fft_real*)malloc((size_t)N2 * sizeof(notorious_fft_real));
-        if (col) {
-            for (int n = 0; n < N1; n++) {
-                for (int i = 0; i < N2; i++) col[i] = temp[n + i*N1];
-                notorious_fft_dst2(col, col, a->sub2);
-                for (int i = 0; i < N2; i++) y[n + i*N1] = col[i];
-            }
-        }
-        free(col);
-        free(temp);
+        notorious_fft_apply_mdrx(x, y, a, notorious_fft_dst2);
     } else {
         notorious_fft_s_dst2_1d(x, y, a);
     }
@@ -3179,28 +4414,11 @@ static void notorious_fft_s_dct3_1d(notorious_fft_real* x, notorious_fft_real* y
 }
 
 void notorious_fft_dct3(notorious_fft_real* x, notorious_fft_real* y, const notorious_fft_aux* a) {
+    if (!a || !x || !y) return;
     if (a->plan) {
         notorious_fft_s_dct3_1d(x, y, a);
     } else if (a->sub2) {
-        int N1 = a->sub1 ? a->sub1->N : 1;
-        int N2 = a->sub2->N;
-        if (N1 == 1) { notorious_fft_dct3(x, y, a->sub2); return; }
-        int total = N1 * N2;
-        notorious_fft_real* temp = (notorious_fft_real*)malloc((size_t)total * sizeof(notorious_fft_real));
-        if (!temp) return;
-        /* No OpenMP — shared plan buffers are not thread-safe */
-        for (int n = 0; n < N2; n++)
-            notorious_fft_dct3(x + n*N1, temp + n*N1, a->sub1);
-        notorious_fft_real* col = (notorious_fft_real*)malloc((size_t)N2 * sizeof(notorious_fft_real));
-        if (col) {
-            for (int n = 0; n < N1; n++) {
-                for (int i = 0; i < N2; i++) col[i] = temp[n + i*N1];
-                notorious_fft_dct3(col, col, a->sub2);
-                for (int i = 0; i < N2; i++) y[n + i*N1] = col[i];
-            }
-        }
-        free(col);
-        free(temp);
+        notorious_fft_apply_mdrx(x, y, a, notorious_fft_dct3);
     } else {
         notorious_fft_s_dct3_1d(x, y, a);
     }
@@ -3235,28 +4453,11 @@ static void notorious_fft_s_dst3_1d(notorious_fft_real* x, notorious_fft_real* y
 }
 
 void notorious_fft_dst3(notorious_fft_real* x, notorious_fft_real* y, const notorious_fft_aux* a) {
+    if (!a || !x || !y) return;
     if (a->plan) {
         notorious_fft_s_dst3_1d(x, y, a);
     } else if (a->sub2) {
-        int N1 = a->sub1 ? a->sub1->N : 1;
-        int N2 = a->sub2->N;
-        if (N1 == 1) { notorious_fft_dst3(x, y, a->sub2); return; }
-        int total = N1 * N2;
-        notorious_fft_real* temp = (notorious_fft_real*)malloc((size_t)total * sizeof(notorious_fft_real));
-        if (!temp) return;
-        /* No OpenMP — shared plan buffers are not thread-safe */
-        for (int n = 0; n < N2; n++)
-            notorious_fft_dst3(x + n*N1, temp + n*N1, a->sub1);
-        notorious_fft_real* col = (notorious_fft_real*)malloc((size_t)N2 * sizeof(notorious_fft_real));
-        if (col) {
-            for (int n = 0; n < N1; n++) {
-                for (int i = 0; i < N2; i++) col[i] = temp[n + i*N1];
-                notorious_fft_dst3(col, col, a->sub2);
-                for (int i = 0; i < N2; i++) y[n + i*N1] = col[i];
-            }
-        }
-        free(col);
-        free(temp);
+        notorious_fft_apply_mdrx(x, y, a, notorious_fft_dst3);
     } else {
         notorious_fft_s_dst3_1d(x, y, a);
     }
@@ -3531,55 +4732,20 @@ static void notorious_fft_s_t4_1d(notorious_fft_real* x, notorious_fft_real* y, 
 }
 
 void notorious_fft_dct4(notorious_fft_real* x, notorious_fft_real* y, const notorious_fft_aux* a) {
+    if (!a || !x || !y) return;
     if (a->plan || a->N == 1 || (a->e && a->t)) {
         notorious_fft_s_t4_1d(x, y, a, 0);
     } else if (a->sub2) {
-        /* Multi-dimensional */
-        int N1 = a->sub1 ? a->sub1->N : 1;
-        int N2 = a->sub2->N;
-        if (N1 == 1) { notorious_fft_dct4(x, y, a->sub2); return; }
-        int total = N1 * N2;
-        notorious_fft_real* temp = (notorious_fft_real*)malloc((size_t)total * sizeof(notorious_fft_real));
-        if (!temp) return;
-        /* No OpenMP — shared plan buffers are not thread-safe */
-        for (int n = 0; n < N2; n++)
-            notorious_fft_dct4(x + n*N1, temp + n*N1, a->sub1);
-        notorious_fft_real* col = (notorious_fft_real*)malloc((size_t)N2 * sizeof(notorious_fft_real));
-        if (col) {
-            for (int n = 0; n < N1; n++) {
-                for (int i = 0; i < N2; i++) col[i] = temp[n + i*N1];
-                notorious_fft_dct4(col, col, a->sub2);
-                for (int i = 0; i < N2; i++) y[n + i*N1] = col[i];
-            }
-        }
-        free(col);
-        free(temp);
+        notorious_fft_apply_mdrx(x, y, a, notorious_fft_dct4);
     }
 }
 
 void notorious_fft_dst4(notorious_fft_real* x, notorious_fft_real* y, const notorious_fft_aux* a) {
+    if (!a || !x || !y) return;
     if (a->plan || a->N == 1 || (a->e && a->t)) {
         notorious_fft_s_t4_1d(x, y, a, 1);
     } else if (a->sub2) {
-        int N1 = a->sub1 ? a->sub1->N : 1;
-        int N2 = a->sub2->N;
-        if (N1 == 1) { notorious_fft_dst4(x, y, a->sub2); return; }
-        int total = N1 * N2;
-        notorious_fft_real* temp = (notorious_fft_real*)malloc((size_t)total * sizeof(notorious_fft_real));
-        if (!temp) return;
-        /* No OpenMP — shared plan buffers are not thread-safe */
-        for (int n = 0; n < N2; n++)
-            notorious_fft_dst4(x + n*N1, temp + n*N1, a->sub1);
-        notorious_fft_real* col = (notorious_fft_real*)malloc((size_t)N2 * sizeof(notorious_fft_real));
-        if (col) {
-            for (int n = 0; n < N1; n++) {
-                for (int i = 0; i < N2; i++) col[i] = temp[n + i*N1];
-                notorious_fft_dst4(col, col, a->sub2);
-                for (int i = 0; i < N2; i++) y[n + i*N1] = col[i];
-            }
-        }
-        free(col);
-        free(temp);
+        notorious_fft_apply_mdrx(x, y, a, notorious_fft_dst4);
     }
 }
 
@@ -3613,6 +4779,13 @@ notorious_fft_aux* notorious_fft_mkaux_dft_1d(int N) {
     }
 
     notorious_fft_init_aux_from_plan(a);
+    /* Strided scatter scratch (N interleaved complexes) — no malloc at execute. */
+    a->scratch_re = (notorious_fft_real*)notorious_fft_malloc((size_t)N * 2 * sizeof(notorious_fft_real));
+    if (!a->scratch_re) {
+        notorious_fft_destroy_plan(a->plan);
+        free(a);
+        return NULL;
+    }
     return a;
 }
 
@@ -3695,13 +4868,19 @@ notorious_fft_aux* notorious_fft_mkaux_realdft(int d, int* Ns) {
 
         notorious_fft_aux* a = (notorious_fft_aux*)malloc(sizeof(notorious_fft_aux));
         if (!a) return NULL;
+        memset(a, 0, sizeof(*a));
 
         a->N = Ns[d-1] * p;
-        a->plan = NULL;
         a->sub1 = notorious_fft_mkaux_realdft_1d(Ns[d-1]);
         a->sub2 = notorious_fft_mkaux_dft(d - 1, Ns);
 
         if (!a->sub1 || !a->sub2) {
+            notorious_fft_free_aux(a);
+            return NULL;
+        }
+        /* Column scratch for complex DFTs of the first d-1 dims (p complexes). */
+        a->scratch_re = (notorious_fft_real*)notorious_fft_malloc((size_t)p * 2 * sizeof(notorious_fft_real));
+        if (!a->scratch_re) {
             notorious_fft_free_aux(a);
             return NULL;
         }
@@ -3874,6 +5053,14 @@ static notorious_fft_aux* notorious_fft_make_aux(int d, int* Ns, int datasz,
         }
         a->sub1 = notorious_fft_make_aux(d - 1, Ns + 1, datasz, aux_1d);
         a->sub2 = (*aux_1d)(Ns[0]);
+        if (datasz == (int)sizeof(notorious_fft_real) && Ns[0] > 0) {
+            a->scratch_re = (notorious_fft_real*)notorious_fft_malloc((size_t)Ns[0] * sizeof(notorious_fft_real));
+            a->scratch_im = (notorious_fft_real*)notorious_fft_malloc((size_t)Ns[0] * sizeof(notorious_fft_real));
+            if (!a->scratch_re || !a->scratch_im) {
+                notorious_fft_free_aux(a);
+                return NULL;
+            }
+        }
     }
 
     if ((d > 1 && !a->sub1) || !a->sub2) {
@@ -3894,6 +5081,403 @@ void notorious_fft_free_aux(notorious_fft_aux* a) {
     notorious_fft_free_aux(a->sub1);
     notorious_fft_free_aux(a->sub2);
     free(a);
+}
+
+#endif /* NOTORIOUS_FFT_IMPLEMENTATION */
+
+/* ==========================================================================
+ * 08_api.h
+ * ========================================================================== */
+
+/*
+ * Notorious FFT - FFTW-shaped planner / execute API
+ *
+ * Native names use the notorious_fft_ prefix. include/notorious_fft_fftw.h
+ * aliases the FFTW3 basic+advanced (many) symbols onto these.
+ */
+
+
+#define NOTORIOUS_FFT_FORWARD          (-1)
+#define NOTORIOUS_FFT_BACKWARD         (+1)
+
+#define NOTORIOUS_FFT_MEASURE          (0U)
+#define NOTORIOUS_FFT_DESTROY_INPUT    (1U << 0)
+#define NOTORIOUS_FFT_UNALIGNED        (1U << 1)
+#define NOTORIOUS_FFT_CONSERVE_MEMORY  (1U << 2)
+#define NOTORIOUS_FFT_EXHAUSTIVE       (1U << 3)
+#define NOTORIOUS_FFT_PRESERVE_INPUT   (1U << 4)
+#define NOTORIOUS_FFT_PATIENT          (1U << 5)
+#define NOTORIOUS_FFT_ESTIMATE         (1U << 6)
+
+typedef enum {
+    NOTORIOUS_FFT_R2HC    = 0,
+    NOTORIOUS_FFT_HC2R    = 1,
+    NOTORIOUS_FFT_DHT     = 2,
+    NOTORIOUS_FFT_REDFT00 = 3,
+    NOTORIOUS_FFT_REDFT01 = 4,  /* DCT-III */
+    NOTORIOUS_FFT_REDFT10 = 5,  /* DCT-II  */
+    NOTORIOUS_FFT_REDFT11 = 6,  /* DCT-IV  */
+    NOTORIOUS_FFT_RODFT00 = 7,
+    NOTORIOUS_FFT_RODFT01 = 8,  /* DST-III */
+    NOTORIOUS_FFT_RODFT10 = 9,  /* DST-II  */
+    NOTORIOUS_FFT_RODFT11 = 10  /* DST-IV  */
+} notorious_fft_r2r_kind;
+
+typedef enum {
+    NOTORIOUS_FFT_IO_DFT = 0,
+    NOTORIOUS_FFT_IO_R2C = 1,
+    NOTORIOUS_FFT_IO_C2R = 2,
+    NOTORIOUS_FFT_IO_R2R = 3
+} notorious_fft_io_kind;
+
+typedef struct notorious_fft_io_plan {
+    int rank;
+    int n[8];
+    int sign;
+    unsigned flags;
+    notorious_fft_io_kind kind;
+    notorious_fft_r2r_kind r2r_kind[8];
+    void *in;
+    void *out;
+    notorious_fft_aux *aux;
+    int howmany;
+    int istride, ostride;
+    int idist, odist;
+} notorious_fft_io_plan;
+
+notorious_fft_io_plan *notorious_fft_plan_dft_1d(int n, notorious_fft_cmpl *in, notorious_fft_cmpl *out,
+                                                 int sign, unsigned flags);
+notorious_fft_io_plan *notorious_fft_plan_dft_2d(int n0, int n1, notorious_fft_cmpl *in, notorious_fft_cmpl *out,
+                                                 int sign, unsigned flags);
+notorious_fft_io_plan *notorious_fft_plan_dft_3d(int n0, int n1, int n2, notorious_fft_cmpl *in, notorious_fft_cmpl *out,
+                                                 int sign, unsigned flags);
+notorious_fft_io_plan *notorious_fft_plan_dft(int rank, const int *n, notorious_fft_cmpl *in, notorious_fft_cmpl *out,
+                                              int sign, unsigned flags);
+
+notorious_fft_io_plan *notorious_fft_plan_dft_r2c_1d(int n, notorious_fft_real *in, notorious_fft_cmpl *out,
+                                                     unsigned flags);
+notorious_fft_io_plan *notorious_fft_plan_dft_c2r_1d(int n, notorious_fft_cmpl *in, notorious_fft_real *out,
+                                                     unsigned flags);
+notorious_fft_io_plan *notorious_fft_plan_dft_r2c_2d(int n0, int n1, notorious_fft_real *in, notorious_fft_cmpl *out,
+                                                     unsigned flags);
+notorious_fft_io_plan *notorious_fft_plan_dft_c2r_2d(int n0, int n1, notorious_fft_cmpl *in, notorious_fft_real *out,
+                                                     unsigned flags);
+
+notorious_fft_io_plan *notorious_fft_plan_r2r_1d(int n, notorious_fft_real *in, notorious_fft_real *out,
+                                                 notorious_fft_r2r_kind kind, unsigned flags);
+
+notorious_fft_io_plan *notorious_fft_plan_many_dft(int rank, const int *n, int howmany,
+                                                   notorious_fft_cmpl *in, const int *inembed,
+                                                   int istride, int idist,
+                                                   notorious_fft_cmpl *out, const int *onembed,
+                                                   int ostride, int odist,
+                                                   int sign, unsigned flags);
+
+void notorious_fft_execute(const notorious_fft_io_plan *p);
+void notorious_fft_execute_dft(const notorious_fft_io_plan *p, notorious_fft_cmpl *in, notorious_fft_cmpl *out);
+void notorious_fft_execute_dft_r2c(const notorious_fft_io_plan *p, notorious_fft_real *in, notorious_fft_cmpl *out);
+void notorious_fft_execute_dft_c2r(const notorious_fft_io_plan *p, notorious_fft_cmpl *in, notorious_fft_real *out);
+void notorious_fft_execute_r2r(const notorious_fft_io_plan *p, notorious_fft_real *in, notorious_fft_real *out);
+void notorious_fft_destroy_io_plan(notorious_fft_io_plan *p);
+void notorious_fft_cleanup(void);
+
+#ifdef NOTORIOUS_FFT_IMPLEMENTATION
+
+static notorious_fft_io_plan *notorious_fft_io_plan_new(void) {
+    notorious_fft_io_plan *p = (notorious_fft_io_plan *)calloc(1, sizeof(notorious_fft_io_plan));
+    if (p) {
+        p->howmany = 1;
+        p->istride = 1;
+        p->ostride = 1;
+        p->idist = 1;
+        p->odist = 1;
+    }
+    return p;
+}
+
+notorious_fft_io_plan *notorious_fft_plan_dft(int rank, const int *n, notorious_fft_cmpl *in, notorious_fft_cmpl *out,
+                                              int sign, unsigned flags) {
+    if (!n || rank < 1 || rank > 8) return NULL;
+    for (int i = 0; i < rank; i++)
+        if (n[i] <= 0) return NULL;
+
+    notorious_fft_io_plan *p = notorious_fft_io_plan_new();
+    if (!p) return NULL;
+    p->rank = rank;
+    p->sign = sign;
+    p->flags = flags;
+    p->kind = NOTORIOUS_FFT_IO_DFT;
+    p->in = in;
+    p->out = out;
+    for (int i = 0; i < rank; i++) p->n[i] = n[i];
+
+    if (rank == 1)
+        p->aux = notorious_fft_mkaux_dft_1d(n[0]);
+    else if (rank == 2)
+        p->aux = notorious_fft_mkaux_dft_2d(n[0], n[1]);
+    else if (rank == 3)
+        p->aux = notorious_fft_mkaux_dft_3d(n[0], n[1], n[2]);
+    else {
+        int ns[8];
+        for (int i = 0; i < rank; i++) ns[i] = n[i];
+        p->aux = notorious_fft_mkaux_dft(rank, ns);
+    }
+    if (!p->aux) {
+        free(p);
+        return NULL;
+    }
+    /* MEASURE (default FFTW flags=0): pick iterative vs split-radix on 1D pow2. */
+    if (rank == 1 && p->aux->plan && !(flags & NOTORIOUS_FFT_ESTIMATE))
+        notorious_fft_tune_plan(p->aux->plan);
+    return p;
+}
+
+notorious_fft_io_plan *notorious_fft_plan_dft_1d(int n, notorious_fft_cmpl *in, notorious_fft_cmpl *out,
+                                                 int sign, unsigned flags) {
+    return notorious_fft_plan_dft(1, &n, in, out, sign, flags);
+}
+
+notorious_fft_io_plan *notorious_fft_plan_dft_2d(int n0, int n1, notorious_fft_cmpl *in, notorious_fft_cmpl *out,
+                                                 int sign, unsigned flags) {
+    int ns[2] = {n0, n1};
+    return notorious_fft_plan_dft(2, ns, in, out, sign, flags);
+}
+
+notorious_fft_io_plan *notorious_fft_plan_dft_3d(int n0, int n1, int n2, notorious_fft_cmpl *in, notorious_fft_cmpl *out,
+                                                 int sign, unsigned flags) {
+    int ns[3] = {n0, n1, n2};
+    return notorious_fft_plan_dft(3, ns, in, out, sign, flags);
+}
+
+notorious_fft_io_plan *notorious_fft_plan_dft_r2c_1d(int n, notorious_fft_real *in, notorious_fft_cmpl *out,
+                                                     unsigned flags) {
+    if (n <= 0) return NULL;
+    notorious_fft_io_plan *p = notorious_fft_io_plan_new();
+    if (!p) return NULL;
+    p->rank = 1;
+    p->n[0] = n;
+    p->sign = NOTORIOUS_FFT_FORWARD;
+    p->flags = flags;
+    p->kind = NOTORIOUS_FFT_IO_R2C;
+    p->in = in;
+    p->out = out;
+    p->aux = notorious_fft_mkaux_realdft_1d(n);
+    if (!p->aux) { free(p); return NULL; }
+    return p;
+}
+
+notorious_fft_io_plan *notorious_fft_plan_dft_c2r_1d(int n, notorious_fft_cmpl *in, notorious_fft_real *out,
+                                                     unsigned flags) {
+    if (n <= 0) return NULL;
+    notorious_fft_io_plan *p = notorious_fft_io_plan_new();
+    if (!p) return NULL;
+    p->rank = 1;
+    p->n[0] = n;
+    p->sign = NOTORIOUS_FFT_BACKWARD;
+    p->flags = flags;
+    p->kind = NOTORIOUS_FFT_IO_C2R;
+    p->in = in;
+    p->out = out;
+    p->aux = notorious_fft_mkaux_realdft_1d(n);
+    if (!p->aux) { free(p); return NULL; }
+    return p;
+}
+
+notorious_fft_io_plan *notorious_fft_plan_dft_r2c_2d(int n0, int n1, notorious_fft_real *in, notorious_fft_cmpl *out,
+                                                     unsigned flags) {
+    if (n0 <= 0 || n1 <= 0) return NULL;
+    notorious_fft_io_plan *p = notorious_fft_io_plan_new();
+    if (!p) return NULL;
+    p->rank = 2;
+    p->n[0] = n0;
+    p->n[1] = n1;
+    p->kind = NOTORIOUS_FFT_IO_R2C;
+    p->flags = flags;
+    p->in = in;
+    p->out = out;
+    p->aux = notorious_fft_mkaux_realdft_2d(n0, n1);
+    if (!p->aux) { free(p); return NULL; }
+    return p;
+}
+
+notorious_fft_io_plan *notorious_fft_plan_dft_c2r_2d(int n0, int n1, notorious_fft_cmpl *in, notorious_fft_real *out,
+                                                     unsigned flags) {
+    if (n0 <= 0 || n1 <= 0) return NULL;
+    notorious_fft_io_plan *p = notorious_fft_io_plan_new();
+    if (!p) return NULL;
+    p->rank = 2;
+    p->n[0] = n0;
+    p->n[1] = n1;
+    p->kind = NOTORIOUS_FFT_IO_C2R;
+    p->flags = flags;
+    p->in = in;
+    p->out = out;
+    p->aux = notorious_fft_mkaux_realdft_2d(n0, n1);
+    if (!p->aux) { free(p); return NULL; }
+    return p;
+}
+
+static notorious_fft_aux *notorious_fft_aux_for_r2r(int n, notorious_fft_r2r_kind k) {
+    switch (k) {
+    case NOTORIOUS_FFT_REDFT10:
+    case NOTORIOUS_FFT_REDFT01:
+    case NOTORIOUS_FFT_RODFT10:
+    case NOTORIOUS_FFT_RODFT01:
+        return notorious_fft_mkaux_t2t3_1d(n);
+    case NOTORIOUS_FFT_REDFT11:
+    case NOTORIOUS_FFT_RODFT11:
+        return notorious_fft_mkaux_t4_1d(n);
+    default:
+        return NULL;
+    }
+}
+
+notorious_fft_io_plan *notorious_fft_plan_r2r_1d(int n, notorious_fft_real *in, notorious_fft_real *out,
+                                                 notorious_fft_r2r_kind kind, unsigned flags) {
+    if (n <= 0) return NULL;
+    notorious_fft_aux *aux = notorious_fft_aux_for_r2r(n, kind);
+    if (!aux) return NULL;
+    notorious_fft_io_plan *p = notorious_fft_io_plan_new();
+    if (!p) { notorious_fft_free_aux(aux); return NULL; }
+    p->rank = 1;
+    p->n[0] = n;
+    p->kind = NOTORIOUS_FFT_IO_R2R;
+    p->r2r_kind[0] = kind;
+    p->flags = flags;
+    p->in = in;
+    p->out = out;
+    p->aux = aux;
+    return p;
+}
+
+notorious_fft_io_plan *notorious_fft_plan_many_dft(int rank, const int *n, int howmany,
+                                                   notorious_fft_cmpl *in, const int *inembed,
+                                                   int istride, int idist,
+                                                   notorious_fft_cmpl *out, const int *onembed,
+                                                   int ostride, int odist,
+                                                   int sign, unsigned flags) {
+    (void)inembed;
+    (void)onembed;
+    if (howmany <= 0 || istride == 0 || ostride == 0) return NULL;
+    notorious_fft_io_plan *p = notorious_fft_plan_dft(rank, n, in, out, sign, flags);
+    if (!p) return NULL;
+    p->howmany = howmany;
+    p->istride = istride;
+    p->ostride = ostride;
+    p->idist = idist;
+    p->odist = odist;
+    return p;
+}
+
+static void notorious_fft_execute_one_dft(const notorious_fft_io_plan *p,
+                                          notorious_fft_cmpl *in, notorious_fft_cmpl *out) {
+    if (p->sign == NOTORIOUS_FFT_BACKWARD)
+        notorious_fft_invdft(in, out, p->aux);
+    else
+        notorious_fft_dft(in, out, p->aux);
+}
+
+void notorious_fft_execute_dft(const notorious_fft_io_plan *p, notorious_fft_cmpl *in, notorious_fft_cmpl *out) {
+    if (!p || !p->aux || !in || !out) return;
+    if (p->kind != NOTORIOUS_FFT_IO_DFT) return;
+
+    if (p->howmany == 1 && p->istride == 1 && p->ostride == 1) {
+        notorious_fft_execute_one_dft(p, in, out);
+        return;
+    }
+
+    /* Batched unit-geometry 1D: howmany independent transforms, dist apart. */
+    if (p->rank == 1 && p->istride == 1 && p->ostride == 1) {
+        int n = p->n[0];
+        for (int k = 0; k < p->howmany; k++)
+            notorious_fft_execute_one_dft(p, in + k * p->idist, out + k * p->odist);
+        (void)n;
+        return;
+    }
+
+    /* Strided many: gather → 1D → scatter using aux scratch. */
+    if (p->rank == 1) {
+        int n = p->n[0];
+        notorious_fft_cmpl *tmp_in = (notorious_fft_cmpl *)p->aux->scratch_re;
+        if (!tmp_in) return;
+        /* Need a second scratch for out-of-place strided; reuse plan work via a stack-sized
+         * cap only when n is small. For general n, transform in-place in a local buffer
+         * allocated on the aux already (scratch_re holds n complexes). Copy in, FFT, scatter. */
+        for (int k = 0; k < p->howmany; k++) {
+            notorious_fft_cmpl *ik = in + k * p->idist;
+            notorious_fft_cmpl *ok = out + k * p->odist;
+            for (int i = 0; i < n; i++)
+                memcpy(&tmp_in[i], &ik[i * p->istride], sizeof(notorious_fft_cmpl));
+            notorious_fft_execute_one_dft(p, tmp_in, tmp_in);
+            for (int i = 0; i < n; i++)
+                memcpy(&ok[i * p->ostride], &tmp_in[i], sizeof(notorious_fft_cmpl));
+        }
+        return;
+    }
+
+    notorious_fft_execute_one_dft(p, in, out);
+}
+
+void notorious_fft_execute_dft_r2c(const notorious_fft_io_plan *p, notorious_fft_real *in, notorious_fft_cmpl *out) {
+    if (!p || !p->aux || !in || !out) return;
+    notorious_fft_realdft(in, out, p->aux);
+}
+
+void notorious_fft_execute_dft_c2r(const notorious_fft_io_plan *p, notorious_fft_cmpl *in, notorious_fft_real *out) {
+    if (!p || !p->aux || !in || !out) return;
+    if ((p->flags & NOTORIOUS_FFT_PRESERVE_INPUT) && in == (notorious_fft_cmpl *)p->in) {
+        /* Preserve by copying into aux scratch when possible. */
+        int n = p->n[0];
+        size_t bins = (size_t)(n / 2 + 1);
+        notorious_fft_cmpl *tmp = (notorious_fft_cmpl *)p->aux->scratch_re;
+        if (tmp && p->rank == 1) {
+            memcpy(tmp, in, bins * sizeof(notorious_fft_cmpl));
+            notorious_fft_invrealdft(tmp, out, p->aux);
+            return;
+        }
+    }
+    notorious_fft_invrealdft(in, out, p->aux);
+}
+
+void notorious_fft_execute_r2r(const notorious_fft_io_plan *p, notorious_fft_real *in, notorious_fft_real *out) {
+    if (!p || !p->aux || !in || !out) return;
+    switch (p->r2r_kind[0]) {
+    case NOTORIOUS_FFT_REDFT10: notorious_fft_dct2(in, out, p->aux); break;
+    case NOTORIOUS_FFT_REDFT01: notorious_fft_dct3(in, out, p->aux); break;
+    case NOTORIOUS_FFT_REDFT11: notorious_fft_dct4(in, out, p->aux); break;
+    case NOTORIOUS_FFT_RODFT10: notorious_fft_dst2(in, out, p->aux); break;
+    case NOTORIOUS_FFT_RODFT01: notorious_fft_dst3(in, out, p->aux); break;
+    case NOTORIOUS_FFT_RODFT11: notorious_fft_dst4(in, out, p->aux); break;
+    default: break;
+    }
+}
+
+void notorious_fft_execute(const notorious_fft_io_plan *p) {
+    if (!p) return;
+    switch (p->kind) {
+    case NOTORIOUS_FFT_IO_DFT:
+        notorious_fft_execute_dft(p, (notorious_fft_cmpl *)p->in, (notorious_fft_cmpl *)p->out);
+        break;
+    case NOTORIOUS_FFT_IO_R2C:
+        notorious_fft_execute_dft_r2c(p, (notorious_fft_real *)p->in, (notorious_fft_cmpl *)p->out);
+        break;
+    case NOTORIOUS_FFT_IO_C2R:
+        notorious_fft_execute_dft_c2r(p, (notorious_fft_cmpl *)p->in, (notorious_fft_real *)p->out);
+        break;
+    case NOTORIOUS_FFT_IO_R2R:
+        notorious_fft_execute_r2r(p, (notorious_fft_real *)p->in, (notorious_fft_real *)p->out);
+        break;
+    }
+}
+
+void notorious_fft_destroy_io_plan(notorious_fft_io_plan *p) {
+    if (!p) return;
+    notorious_fft_free_aux(p->aux);
+    free(p);
+}
+
+void notorious_fft_cleanup(void) {
+    /* No global state. */
 }
 
 #endif /* NOTORIOUS_FFT_IMPLEMENTATION */

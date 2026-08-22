@@ -93,6 +93,110 @@ static NOTORIOUS_FFT_INLINE void notorious_fft_free(void* ptr) {
 #endif
 }
 
+static NOTORIOUS_FFT_INLINE int notorious_fft_alignment(void) {
+    return NOTORIOUS_FFT_ALIGNMENT;
+}
+
+/* Next power of two >= v. Returns 0 on overflow (v too large). */
+static NOTORIOUS_FFT_INLINE size_t notorious_fft_next_pow2(size_t v) {
+    if (v == 0) return 1;
+    if (v > ((size_t)1 << (sizeof(size_t) * 8 - 1))) return 0;
+    v--;
+    v |= v >> 1;
+    v |= v >> 2;
+    v |= v >> 4;
+    v |= v >> 8;
+    v |= v >> 16;
+#if SIZE_MAX > 0xffffffffu
+    v |= v >> 32;
+#endif
+    return v + 1;
+}
+
+/* True iff n = 2^a * 3^b * 5^c * 7^d (and n > 0). */
+static NOTORIOUS_FFT_INLINE int notorious_fft_is_2357_smooth(size_t n) {
+    if (n == 0) return 0;
+    while ((n & 1u) == 0) n >>= 1;
+    while (n % 3u == 0) n /= 3u;
+    while (n % 5u == 0) n /= 5u;
+    while (n % 7u == 0) n /= 7u;
+    return n == 1;
+}
+
+/* True iff n = 2^p − 1 (all bits set). Cheap: (n & (n+1)) == 0.
+ * Mersenne primes are the prime subset (3, 7, 31, 127, …).
+ * Padding one zero and taking a 2^p FFT is NOT an n-point DFT — bin
+ * frequencies are 2πk/2^p, not 2πk/n. Rader is the valid fast path. */
+static NOTORIOUS_FFT_INLINE int notorious_fft_is_mersenne_number(size_t n) {
+    return n != 0 && (n & (n + (size_t)1)) == 0;
+}
+
+static NOTORIOUS_FFT_INLINE int notorious_fft_is_prime(size_t n) {
+    if (n < 2) return 0;
+    if ((n & 1u) == 0) return n == 2;
+    if (n % 3u == 0) return n == 3;
+    if (n % 5u == 0) return n == 5;
+    if (n % 7u == 0) return n == 7;
+    /* i <= n/i avoids overflow on i*i. */
+    for (size_t i = 11, j = 13; i <= n / i; i += 6, j += 6) {
+        if (n % i == 0 || n % j == 0) return 0;
+    }
+    return 1;
+}
+
+/* (b^e) mod m. Residues fit in uint64 when m ≤ 2^32; __int128 otherwise. */
+static NOTORIOUS_FFT_INLINE size_t notorious_fft_modpow(size_t b, size_t e, size_t m) {
+    if (m <= 1) return 0;
+    uint64_t r = 1, bb = (uint64_t)b % (uint64_t)m, mm = (uint64_t)m;
+#if defined(__SIZEOF_INT128__)
+    while (e) {
+        if (e & 1) r = (uint64_t)(((__uint128_t)r * bb) % mm);
+        bb = (uint64_t)(((__uint128_t)bb * bb) % mm);
+        e >>= 1;
+    }
+#else
+    if (mm > 0xffffffffu) return 0;
+    while (e) {
+        if (e & 1) r = (r * bb) % mm;
+        bb = (bb * bb) % mm;
+        e >>= 1;
+    }
+#endif
+    return (size_t)r;
+}
+
+/* Primitive root modulo prime n, or 0. Requires n−1 to be 2·3·5·7-smooth. */
+static NOTORIOUS_FFT_INLINE size_t notorious_fft_primitive_root(size_t n) {
+    if (n < 3) return 0;
+    size_t factors[4];
+    int nf = 0;
+    size_t m = n - 1;
+    if ((m & 1u) == 0) { factors[nf++] = 2; while ((m & 1u) == 0) m >>= 1; }
+    if (m % 3u == 0) { factors[nf++] = 3; while (m % 3u == 0) m /= 3u; }
+    if (m % 5u == 0) { factors[nf++] = 5; while (m % 5u == 0) m /= 5u; }
+    if (m % 7u == 0) { factors[nf++] = 7; while (m % 7u == 0) m /= 7u; }
+    if (m != 1) return 0;
+    for (size_t g = 2; g < n; g++) {
+        int ok = 1;
+        for (int i = 0; i < nf; i++) {
+            if (notorious_fft_modpow(g, (n - 1) / factors[i], n) == 1) {
+                ok = 0;
+                break;
+            }
+        }
+        if (ok) return g;
+    }
+    return 0;
+}
+
+#ifdef NOTORIOUS_FFT_DEBUG
+#include <assert.h>
+#define NOTORIOUS_FFT_ASSERT_ALIGNED(p) \
+    assert(((uintptr_t)(p) & (NOTORIOUS_FFT_ALIGNMENT - 1)) == 0)
+#else
+#define NOTORIOUS_FFT_ASSERT_ALIGNED(p) ((void)0)
+#endif
+
 /* ============================================================================
  * Bump Allocator — decrement-from-end, no per-free bookkeeping
  *

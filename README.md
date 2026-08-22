@@ -13,12 +13,12 @@ Notorious FFT provides a complete set of discrete transforms in a single header 
 ## Features
 
 - **Header-only**: single file `include/notorious_fft.h`, just `#include` and go
-- **All transform types**: complex DFT, real DFT, DCT-2/3/4, DST-2/3/4
-- **Any dimensionality**: 1D, 2D, 3D, and arbitrary N-dimensional transforms
-- **SIMD support**: AVX2/AVX512/NEON vectorization for butterfly operations
-- **OpenMP support**: automatic parallelization for large transforms
-- **Fast approximations**: Bhaskara I sine/cosine approximations for faster twiddle computation
+- **FFTW-shaped planner**: `plan_dft_*` / `execute` / `destroy_io_plan`, plus `include/notorious_fft_fftw.h` aliases
+- **All transform types**: complex DFT, real DFT (including 2D/3D r2c), DCT-2/3/4, DST-2/3/4
+- **Any size**: split-radix for powers of two, mixed-radix 3/5/7, Rader for primes with smooth N−1, Bluestein otherwise
+- **SIMD**: NEON, AVX2, AVX-512 selected at compile time (not stubs)
 - **Single and double precision**: define `NOTORIOUS_FFT_SINGLE` for float, default is double
+- **Version**: 1.0.0 (`NOTORIOUS_FFT_VERSION_*`)
 
 ### Accuracy Modes
 
@@ -27,17 +27,43 @@ Notorious FFT provides a complete set of discrete transforms in a single header 
 
 ## Quick Start
 
+Planner API (recommended):
+
 ```c
 #define NOTORIOUS_FFT_IMPLEMENTATION
 #include "notorious_fft.h"
 
-/* 1D complex DFT */
-notorious_fft_cmpl x[1024], y[1024];
+notorious_fft_cmpl *x = notorious_fft_malloc(1024 * sizeof(notorious_fft_cmpl));
+notorious_fft_cmpl *y = notorious_fft_malloc(1024 * sizeof(notorious_fft_cmpl));
 /* ... fill x ... */
-notorious_fft_aux *a = notorious_fft_mkaux_dft_1d(1024);
-notorious_fft_dft(x, y, a);
-notorious_fft_free_aux(a);
+notorious_fft_io_plan *p = notorious_fft_plan_dft_1d(
+    1024, x, y, NOTORIOUS_FFT_FORWARD, NOTORIOUS_FFT_ESTIMATE);
+notorious_fft_execute(p);
+notorious_fft_destroy_io_plan(p);
+notorious_fft_free(x);
+notorious_fft_free(y);
 ```
+
+Drop-in FFTW3 subset (`examples/fftw_compat.c`):
+
+```c
+#define NOTORIOUS_FFT_IMPLEMENTATION
+#include "notorious_fft.h"
+#include "notorious_fft_fftw.h"
+
+fftw_complex *in = fftw_alloc_complex(1024);
+fftw_complex *out = fftw_alloc_complex(1024);
+fftw_plan p = fftw_plan_dft_1d(1024, in, out, FFTW_FORWARD, FFTW_ESTIMATE);
+fftw_execute(p);
+fftw_destroy_plan(p);
+```
+
+Do not mix `notorious_fft_fftw.h` with linking `libfftw3` in the same translation unit.
+
+**Thread safety:** concurrent `execute` on the **same** plan is not supported (plans own scratch). Distinct plans may run in parallel.
+
+Inverse DFTs are **unnormalized** (same as FFTW): a round-trip is `IDFT(DFT(x)) = N·x`.
+Multi-dimensional c2r/invrealdft may overwrite its input.
 
 ### C++ Usage
 
@@ -111,23 +137,27 @@ This is a header-only library. To use it, define `NOTORIOUS_FFT_IMPLEMENTATION` 
 | Flag | Effect |
 |---|---|
 | `-DNOTORIOUS_FFT_SINGLE` | Use single precision (float) instead of double |
-| `-mfpu=neon` or `-march=armv8-a` | Enable ARM NEON SIMD |
-| `-mavx2` | Enable AVX2 SIMD (stubs) |
-| `-mavx512f` | Enable AVX-512 SIMD (stubs) |
-| `-fopenmp` | Enable OpenMP parallelization |
+| `-DNOTORIOUS_FFT_FAST_MATH` | Bhaskara I twiddles (~0.1% max error; accumulates with N) |
+| `-march=armv8-a` / `-mavx2 -mfma` / `-mavx512f -mavx512dq` | Enable the matching SIMD path |
+| `-fopenmp` | Enable OpenMP (independent batches / large 1D stages) |
+
+Do **not** pass `-ffast-math` if you care about matching libm accuracy.
 
 ### Running Tests
 
 ```sh
-gcc -O2 -I. -o tests/test_notorious_fft tests/test_notoriousfft.c minfft/minfft.c -lm
-./tests/test_notoriousfft
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+./build/test_notoriousfft
+./build/test_notoriousfft_cpp
 ```
 
 ### Running Benchmarks
 
 ```sh
-gcc -O2 -I. -o benchmarks/bench benchmarks/bench.c minfft/minfft.c -lm
-./benchmarks/bench
+cmake -S . -B build -DNOTORIOUS_FFT_BUILD_BENCHMARKS=ON
+cmake --build build --target bench -j
+./build/bench
 ```
 
 For comprehensive benchmarking of all API functions:
@@ -156,54 +186,54 @@ make bench
 ./bench
 ```
 
-**Results:**
+**Results (v1.0.0):**
 ```
 --- Complex DFT (Forward) ---
-N           minfft (us)   notoriousfft (us)  ratio   
+N           minfft (us)   notoriousfft (us)  ratio
 ------------------------------------------------------
-16          0.10          0.11          0.944x
-64          0.51          0.49          1.044x
-256         2.72          2.59          1.049x
-1024        14.12         13.33         1.059x
-4096        71.72         66.06         1.086x
-16384       350.14        332.94        1.052x
-65536       1712.24       1638.09       1.045x
+16          0.08          0.08          0.97x
+64          0.52          0.50          1.04x
+256         2.93          2.72          1.08x
+1024        15.23         13.86         1.10x
+4096        77.59         68.95         1.13x
+16384       384.39        354.75        1.08x
+65536       1896.76       1674.19       1.13x
 
 --- Complex DFT (Inverse) ---
-16          0.08          0.09          0.870x
-64          0.51          0.49          1.052x
-256         2.91          2.60          1.120x
-1024        15.14         13.39         1.131x
-4096        76.86         66.21         1.161x
-16384       376.24        329.73        1.141x
-65536       1793.43       1598.81       1.122x
+16          0.08          0.08          0.927x
+64          0.52          0.49          1.050x
+256         2.93          2.68          1.092x
+1024        15.22         13.67         1.114x
+4096        81.41         69.07         1.179x
+16384       383.55        347.12        1.105x
+65536       1836.34       1635.89       1.123x
 
 --- Real DFT (Forward) ---
-16          0.04          0.05          0.846x
-64          0.29          0.31          0.916x
-256         1.56          1.59          0.983x
-1024        7.86          7.71          1.019x
-4096        38.38         37.45         1.025x
-16384       184.63        181.71        1.016x
-65536       878.21        845.70        1.038x
+16          0.05          0.06          0.834x
+64          0.31          0.33          0.961x
+256         1.69          1.67          1.010x
+1024        8.50          8.16          1.041x
+4096        41.53         39.44         1.053x
+16384       199.84        195.27        1.023x
+65536       956.70        898.27        1.065x
 
 --- DCT Type 2 ---
-16          0.08          0.09          0.876x
-64          0.42          0.43          0.970x
-256         2.07          2.06          1.005x
-1024        9.94          9.69          1.026x
-4096        46.62         44.70         1.043x
-16384       226.05        215.25        1.050x
-65536       1060.05       1011.72       1.048x
+16          0.09          0.10          0.866x
+64          0.46          0.46          1.002x
+256         2.28          2.21          1.027x
+1024        10.89         10.44         1.043x
+4096        50.98         48.34         1.055x
+16384       244.53        231.15        1.058x
+65536       1181.50       1079.74       1.094x
 ```
 
 ### Summary
 
-- **NotoriousFFT** achieves **1.04–1.16x** speedup over minfft for N≥256 on complex transforms
-- Real DFT and DCT-2 show consistent **1.02–1.05x** speedup at larger sizes
-- Small N (16-64) has some overhead; the split-radix terminal cases are highly optimized
-- **SIMD Accelerated** with NEON (ARM) and AVX2/AVX-512 (x86) intrinsics
-- All memory allocated in a single 64-byte-aligned slab; cleanup is a single `free`
+- **v1.0.0** beats minfft by **1.08–1.13×** on complex DFT for N≥256
+- N=16 is essentially tied (0.97×) after FFmpeg-style hardcoded twiddles
+- Mixed-radix **3/5/7**; **Rader** for primes with smooth N−1 (31, 127, 17, 257, …); Bluestein for awkward N
+- Four-step at N≥2²⁰; recursive split-radix is faster at 64K
+- SIMD: NEON (f64 + f32), AVX2 inverse, AVX-512 forward
 
 ### Comprehensive Benchmark
 
@@ -232,7 +262,7 @@ This produces three plots:
 
 ## Algorithm
 
-Notorious FFT uses a split-radix (2/4) decimation-in-frequency algorithm with manually unrolled terminal cases for N=1,2,4,8. Real transforms are reduced to complex transforms of half length. DCT-2/3 are computed via real DFT with pre/post-processing twiddles. DCT-4/DST-4 use an O(N log N) reduction to an N/2-point complex DFT. All per-plan memory is managed through a bump allocator backed by a single 64-byte-aligned slab; destruction is a single `free`.
+Notorious FFT uses split-radix (2/4) decimation-in-frequency by default (no bit-reversal; unrolled terminals for N≤32). `NOTORIOUS_FFT_MEASURE` may select a DIT combine or iterative Cooley–Tukey instead. Real transforms reduce to half-length complex FFTs. Mixed-radix 3/5/7 peels those factors even when the cofactor is prime. Prime lengths whose N−1 is 2·3·5·7-smooth use Rader (an (N−1)-point FFT), including small Mersenne primes 31 and 127 and Fermat primes 17 and 257. Padding a Mersenne length 2^p−1 with one zero and taking a 2^p FFT is a different transform (bin frequencies 2πk/2^p, not 2πk/n) and is not used. Awkward sizes fall back to Bluestein. DCT-2/3 go through real DFT with pre/post twiddles; DCT-4/DST-4 reduce to an N/2-point complex DFT. All per-plan memory is a single 64-byte-aligned slab.
 
 ## License
 

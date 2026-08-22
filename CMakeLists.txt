@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.14)
-project(notoriousfft C CXX)
+project(notoriousfft VERSION 1.0.0 LANGUAGES C CXX)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
@@ -20,11 +20,11 @@ option(NOTORIOUS_FFT_BUILD_EXAMPLES    "Build examples"    ON)
 option(NOTORIOUS_FFT_BUILD_COMPREHENSIVE_BENCHMARK "Build comprehensive benchmark (FFTW3, KissFFT, PocketFFT, muFFT)" OFF)
 
 # ---- Global optimization flags ----
+# Do not pass -ffast-math by default: it rewrites libm sin/cos and breaks
+# accuracy tests. Twiddle approximation is opt-in via NOTORIOUS_FFT_FAST_MATH.
 add_compile_options(
     $<$<CONFIG:Release>:-O3>
-    $<$<CONFIG:Release>:-ffast-math>
     $<$<CONFIG:RelWithDebInfo>:-O3>
-    $<$<CONFIG:RelWithDebInfo>:-ffast-math>
 )
 
 # ---- SIMD auto-detection ----
@@ -123,8 +123,8 @@ FetchContent_MakeAvailable(minfft)
 add_library(minfft STATIC ${minfft_SOURCE_DIR}/minfft.c)
 target_include_directories(minfft PUBLIC ${minfft_SOURCE_DIR})
 target_compile_options(minfft PRIVATE
-    $<$<CONFIG:Release>:-O3 -ffast-math>
-    $<$<CONFIG:RelWithDebInfo>:-O3 -ffast-math>
+    $<$<CONFIG:Release>:-O3>
+    $<$<CONFIG:RelWithDebInfo>:-O3>
     ${NOTORIOUS_FFT_ARCH_FLAGS}
 )
 
@@ -212,8 +212,25 @@ endif()
 # ---- Examples ----
 if(NOTORIOUS_FFT_BUILD_EXAMPLES)
     notoriousfft_add_executable(example_basic examples/basic.c)
+    notoriousfft_add_executable(example_fftw_compat examples/fftw_compat.c)
     notoriousfft_add_executable_cpp(example_cpp_advanced examples/cpp_advanced.cpp)
 endif()
+
+# ---- Install ----
+include(GNUInstallDirs)
+install(FILES
+    ${CMAKE_CURRENT_SOURCE_DIR}/include/notorious_fft.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/include/notorious_fft.hpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/include/notorious_fft_fftw.h
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+)
+configure_file(
+    ${CMAKE_CURRENT_SOURCE_DIR}/notoriousfft.pc.in
+    ${CMAKE_CURRENT_BINARY_DIR}/notoriousfft.pc
+    @ONLY
+)
+install(FILES ${CMAKE_CURRENT_BINARY_DIR}/notoriousfft.pc
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig)
 
 # ---- Comprehensive Benchmark (not built by default) ----
 if(NOTORIOUS_FFT_BUILD_COMPREHENSIVE_BENCHMARK)

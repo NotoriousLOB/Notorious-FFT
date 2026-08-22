@@ -21,6 +21,7 @@ MODULES = [
     "05_algorithms.h",
     "06_plan.h",
     "07_legacy.h",
+    "08_api.h",
 ]
 
 HEADER = """\
@@ -31,11 +32,10 @@ HEADER = """\
  * Edit the module files in src/ and re-run CMake.
  *
  * Features:
- *   - Hardcoded kernels for N ≤ 64
- *   - Bluestein algorithm for arbitrary-size support
- *   - SIMD acceleration: NEON (AArch64/ARM), AVX2, AVX-512 (x86-64)
- *   - OpenMP parallelisation
- *   - minfft-compatible API (notorious_fft_ prefix)
+ *   - Split-radix DIF (DIT under MEASURE), mixed-radix 3/5/7, Rader, Bluestein
+ *   - SIMD: NEON, AVX2, AVX-512 (compile-time)
+ *   - FFTW-shaped planner API (see notorious_fft_fftw.h)
+ *   - OpenMP for large independent batches
  *
  * Usage (C):
  *   #define NOTORIOUS_FFT_IMPLEMENTATION

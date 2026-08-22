@@ -1,0 +1,68 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [gcc, clang]
+        openmp: ["ON", "OFF"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        env:
+          CC: ${{ matrix.compiler }}
+          CXX: ${{ matrix.compiler == 'gcc' && 'g++' || 'clang++' }}
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DNOTORIOUS_FFT_OPENMP=${{ matrix.openmp }} \
+            -DNOTORIOUS_FFT_BUILD_TESTS=ON \
+            -DNOTORIOUS_FFT_BUILD_EXAMPLES=ON \
+            -DNOTORIOUS_FFT_BUILD_BENCHMARKS=OFF
+      - name: Build
+        run: cmake --build build -j
+      - name: Test
+        run: |
+          ./build/test_notoriousfft
+          ./build/test_notoriousfft_cpp
+          ./build/example_basic
+          ./build/example_fftw_compat
+
+  asan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure (ASan+UBSan)
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DNOTORIOUS_FFT_OPENMP=OFF \
+            -DNOTORIOUS_FFT_BUILD_BENCHMARKS=OFF \
+            -DCMAKE_C_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer" \
+            -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer" \
+            -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
+      - name: Build and test
+        run: |
+          cmake --build build -j
+          ./build/test_notoriousfft
+          ./build/test_notoriousfft_cpp
+
+  single:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Single-precision compile check
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DNOTORIOUS_FFT_SINGLE=ON \
+            -DNOTORIOUS_FFT_OPENMP=OFF \
+            -DNOTORIOUS_FFT_BUILD_BENCHMARKS=OFF
+          cmake --build build --target example_basic -j
+          ./build/example_basic

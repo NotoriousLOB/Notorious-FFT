@@ -87,7 +87,7 @@ static void notorious_fft_s_dft_1d(notorious_fft_cmpl* x, notorious_fft_cmpl* y,
     if (sy == 1) {
         notorious_fft_dft_1d_cx(x, y, N, plan, inverse);
     } else {
-        notorious_fft_cmpl* buf = (notorious_fft_cmpl*)malloc((size_t)N * sizeof(notorious_fft_cmpl));
+        notorious_fft_cmpl* buf = (notorious_fft_cmpl*)a->scratch_re;
         if (!buf) return;
         notorious_fft_dft_1d_cx(x, buf, N, plan, inverse);
         notorious_fft_real* br = (notorious_fft_real*)buf;
@@ -96,7 +96,6 @@ static void notorious_fft_s_dft_1d(notorious_fft_cmpl* x, notorious_fft_cmpl* y,
             yr[2 * i * sy]     = br[2 * i];
             yr[2 * i * sy + 1] = br[2 * i + 1];
         }
-        free(buf);
     }
 }
 
@@ -108,6 +107,7 @@ static void notorious_fft_s_dft_1d(notorious_fft_cmpl* x, notorious_fft_cmpl* y,
  *   direct 1D:    plan!=NULL (from mkaux_dft_1d called directly) */
 static void notorious_fft_mkcx(notorious_fft_cmpl* x, notorious_fft_cmpl* y, int sy,
                           const notorious_fft_aux* a, int inverse) {
+    if (!a || !x || !y) return;
     /* Direct 1D aux (plan set, no sub-structures) */
     if (a->plan) {
         notorious_fft_s_dft_1d(x, y, sy, a, inverse);
@@ -144,10 +144,12 @@ static void notorious_fft_mkcx(notorious_fft_cmpl* x, notorious_fft_cmpl* y, int
  * ============================================================================ */
 
 void notorious_fft_dft(notorious_fft_cmpl* x, notorious_fft_cmpl* y, const notorious_fft_aux* a) {
+    if (!a) return;
     notorious_fft_mkcx(x, y, 1, a, 0);
 }
 
 void notorious_fft_invdft(notorious_fft_cmpl* x, notorious_fft_cmpl* y, const notorious_fft_aux* a) {
+    if (!a) return;
     notorious_fft_mkcx(x, y, 1, a, 1);
 }
 
@@ -160,6 +162,28 @@ void notorious_fft_invdft(notorious_fft_cmpl* x, notorious_fft_cmpl* y, const no
  * ============================================================================ */
 
 void notorious_fft_realdft(notorious_fft_real* x, notorious_fft_cmpl* z, const notorious_fft_aux* a) {
+    if (!a || !x || !z) return;
+
+    /* Multi-dimensional: r2c on last dim, then complex DFT on the leading dims
+     * (FFTW packing: output is howmany × (n_last/2+1) complexes, row-major). */
+    if (a->sub1 && a->sub2 && !a->plan) {
+        int n_last = a->sub1->N;
+        int nc = n_last / 2 + 1;
+        int howmany = (n_last > 0) ? (a->N / n_last) : 0;
+        notorious_fft_cmpl *col = (notorious_fft_cmpl *)a->scratch_re;
+        if (howmany <= 0 || !col) return;
+        for (int i = 0; i < howmany; i++)
+            notorious_fft_realdft(x + i * n_last, z + i * nc, a->sub1);
+        for (int k = 0; k < nc; k++) {
+            for (int i = 0; i < howmany; i++)
+                memcpy(&col[i], &z[i * nc + k], sizeof(notorious_fft_cmpl));
+            notorious_fft_dft(col, col, a->sub2);
+            for (int i = 0; i < howmany; i++)
+                memcpy(&z[i * nc + k], &col[i], sizeof(notorious_fft_cmpl));
+        }
+        return;
+    }
+
     int N = a->N;
     if (N == 1) {
         ((notorious_fft_real*)z)[0] = x[0];
@@ -237,6 +261,26 @@ void notorious_fft_realdft(notorious_fft_real* x, notorious_fft_cmpl* z, const n
 }
 
 void notorious_fft_invrealdft(notorious_fft_cmpl* z, notorious_fft_real* y, const notorious_fft_aux* a) {
+    if (!a || !z || !y) return;
+
+    if (a->sub1 && a->sub2 && !a->plan) {
+        int n_last = a->sub1->N;
+        int nc = n_last / 2 + 1;
+        int howmany = (n_last > 0) ? (a->N / n_last) : 0;
+        notorious_fft_cmpl *col = (notorious_fft_cmpl *)a->scratch_re;
+        if (howmany <= 0 || !col) return;
+        for (int k = 0; k < nc; k++) {
+            for (int i = 0; i < howmany; i++)
+                memcpy(&col[i], &z[i * nc + k], sizeof(notorious_fft_cmpl));
+            notorious_fft_invdft(col, col, a->sub2);
+            for (int i = 0; i < howmany; i++)
+                memcpy(&z[i * nc + k], &col[i], sizeof(notorious_fft_cmpl));
+        }
+        for (int i = 0; i < howmany; i++)
+            notorious_fft_invrealdft(z + i * nc, y + i * n_last, a->sub1);
+        return;
+    }
+
     int N = a->N;
     if (N == 1) {
         y[0] = ((notorious_fft_real*)z)[0];
@@ -745,6 +789,33 @@ static NOTORIOUS_FFT_INLINE void notorious_fft_t4_postmul_avx2(
 
 #endif /* NOTORIOUS_FFT_HAS_AVX2 && !NOTORIOUS_FFT_SINGLE */
 
+/* Multi-dimensional real transform via preallocated a->t / scratch_re / scratch_im.
+ * No malloc at execute time. */
+static void notorious_fft_apply_mdrx(
+    notorious_fft_real* x, notorious_fft_real* y, const notorious_fft_aux* a,
+    void (*fn)(notorious_fft_real*, notorious_fft_real*, const notorious_fft_aux*))
+{
+    int N1 = a->sub1 ? a->sub1->N : 1;
+    int N2 = a->sub2->N;
+    if (N1 == 1) {
+        fn(x, y, a->sub2);
+        return;
+    }
+    notorious_fft_real* temp = (notorious_fft_real*)a->t;
+    notorious_fft_real* col_in = a->scratch_re;
+    notorious_fft_real* col_out = a->scratch_im;
+    if (!temp || !col_in || !col_out) return;
+    for (int n = 0; n < N2; n++)
+        fn(x + n * N1, temp + n * N1, a->sub1);
+    for (int n = 0; n < N1; n++) {
+        for (int i = 0; i < N2; i++)
+            col_in[i] = temp[n + i * N1];
+        fn(col_in, col_out, a->sub2);
+        for (int i = 0; i < N2; i++)
+            y[n + i * N1] = col_out[i];
+    }
+}
+
 /* ============================================================================
  * DCT/DST Type 2 — zero-malloc, precomputed twiddles
  *
@@ -796,6 +867,7 @@ static void notorious_fft_s_dct2_1d(notorious_fft_real* x, notorious_fft_real* y
 }
 
 void notorious_fft_dct2(notorious_fft_real* x, notorious_fft_real* y, const notorious_fft_aux* a) {
+    if (!a || !x || !y) return;
     if (a->plan) {
         int N = a->N;
 #if NOTORIOUS_FFT_HAS_AVX2 && !defined(NOTORIOUS_FFT_SINGLE)
@@ -820,45 +892,7 @@ void notorious_fft_dct2(notorious_fft_real* x, notorious_fft_real* y, const noto
 #endif
         notorious_fft_s_dct2_1d(x, y, a);
     } else if (a->sub2) {
-        /* Multi-dimensional: sub1 = higher dims, sub2 = current dim */
-        int N1 = a->sub1 ? a->sub1->N : 1;
-        int N2 = a->sub2->N;
-
-        if (N1 == 1) {
-            notorious_fft_dct2(x, y, a->sub2);
-            return;
-        }
-
-        int total = N1 * N2;
-        notorious_fft_real* temp = (notorious_fft_real*)malloc(total * sizeof(notorious_fft_real));
-        if (!temp) return;
-
-        /* Transform hyperplanes using sub1 — no OpenMP, shared plan buffers are not thread-safe */
-        for (int n = 0; n < N2; n++) {
-            if (a->sub1) {
-                notorious_fft_dct2(x + n * N1, temp + n * N1, a->sub1);
-            } else {
-                memcpy(temp + n * N1, x + n * N1, N1 * sizeof(notorious_fft_real));
-            }
-        }
-
-        /* Transform rows using sub2 — pre-allocate buffers once */
-        notorious_fft_real* col_in = (notorious_fft_real*)malloc(N2 * sizeof(notorious_fft_real));
-        notorious_fft_real* col_out = (notorious_fft_real*)malloc(N2 * sizeof(notorious_fft_real));
-        if (col_in && col_out) {
-            for (int n = 0; n < N1; n++) {
-                for (int k = 0; k < N2; k++) {
-                    col_in[k] = temp[n + k * N1];
-                }
-                notorious_fft_dct2(col_in, col_out, a->sub2);
-                for (int k = 0; k < N2; k++) {
-                    y[n + k * N1] = col_out[k];
-                }
-            }
-        }
-        free(col_in);
-        free(col_out);
-        free(temp);
+        notorious_fft_apply_mdrx(x, y, a, notorious_fft_dct2);
     } else {
         notorious_fft_s_dct2_1d(x, y, a);
     }
@@ -895,6 +929,7 @@ static void notorious_fft_s_dst2_1d(notorious_fft_real* x, notorious_fft_real* y
 }
 
 void notorious_fft_dst2(notorious_fft_real* x, notorious_fft_real* y, const notorious_fft_aux* a) {
+    if (!a || !x || !y) return;
     if (a->plan) {
         int N = a->N;
 #if NOTORIOUS_FFT_HAS_AVX2 && !defined(NOTORIOUS_FFT_SINGLE)
@@ -925,25 +960,7 @@ void notorious_fft_dst2(notorious_fft_real* x, notorious_fft_real* y, const noto
 #endif
         notorious_fft_s_dst2_1d(x, y, a);
     } else if (a->sub2) {
-        int N1 = a->sub1 ? a->sub1->N : 1;
-        int N2 = a->sub2->N;
-        if (N1 == 1) { notorious_fft_dst2(x, y, a->sub2); return; }
-        int total = N1 * N2;
-        notorious_fft_real* temp = (notorious_fft_real*)malloc((size_t)total * sizeof(notorious_fft_real));
-        if (!temp) return;
-        /* No OpenMP — shared plan buffers are not thread-safe */
-        for (int n = 0; n < N2; n++)
-            notorious_fft_dst2(x + n*N1, temp + n*N1, a->sub1);
-        notorious_fft_real* col = (notorious_fft_real*)malloc((size_t)N2 * sizeof(notorious_fft_real));
-        if (col) {
-            for (int n = 0; n < N1; n++) {
-                for (int i = 0; i < N2; i++) col[i] = temp[n + i*N1];
-                notorious_fft_dst2(col, col, a->sub2);
-                for (int i = 0; i < N2; i++) y[n + i*N1] = col[i];
-            }
-        }
-        free(col);
-        free(temp);
+        notorious_fft_apply_mdrx(x, y, a, notorious_fft_dst2);
     } else {
         notorious_fft_s_dst2_1d(x, y, a);
     }
@@ -982,28 +999,11 @@ static void notorious_fft_s_dct3_1d(notorious_fft_real* x, notorious_fft_real* y
 }
 
 void notorious_fft_dct3(notorious_fft_real* x, notorious_fft_real* y, const notorious_fft_aux* a) {
+    if (!a || !x || !y) return;
     if (a->plan) {
         notorious_fft_s_dct3_1d(x, y, a);
     } else if (a->sub2) {
-        int N1 = a->sub1 ? a->sub1->N : 1;
-        int N2 = a->sub2->N;
-        if (N1 == 1) { notorious_fft_dct3(x, y, a->sub2); return; }
-        int total = N1 * N2;
-        notorious_fft_real* temp = (notorious_fft_real*)malloc((size_t)total * sizeof(notorious_fft_real));
-        if (!temp) return;
-        /* No OpenMP — shared plan buffers are not thread-safe */
-        for (int n = 0; n < N2; n++)
-            notorious_fft_dct3(x + n*N1, temp + n*N1, a->sub1);
-        notorious_fft_real* col = (notorious_fft_real*)malloc((size_t)N2 * sizeof(notorious_fft_real));
-        if (col) {
-            for (int n = 0; n < N1; n++) {
-                for (int i = 0; i < N2; i++) col[i] = temp[n + i*N1];
-                notorious_fft_dct3(col, col, a->sub2);
-                for (int i = 0; i < N2; i++) y[n + i*N1] = col[i];
-            }
-        }
-        free(col);
-        free(temp);
+        notorious_fft_apply_mdrx(x, y, a, notorious_fft_dct3);
     } else {
         notorious_fft_s_dct3_1d(x, y, a);
     }
@@ -1038,28 +1038,11 @@ static void notorious_fft_s_dst3_1d(notorious_fft_real* x, notorious_fft_real* y
 }
 
 void notorious_fft_dst3(notorious_fft_real* x, notorious_fft_real* y, const notorious_fft_aux* a) {
+    if (!a || !x || !y) return;
     if (a->plan) {
         notorious_fft_s_dst3_1d(x, y, a);
     } else if (a->sub2) {
-        int N1 = a->sub1 ? a->sub1->N : 1;
-        int N2 = a->sub2->N;
-        if (N1 == 1) { notorious_fft_dst3(x, y, a->sub2); return; }
-        int total = N1 * N2;
-        notorious_fft_real* temp = (notorious_fft_real*)malloc((size_t)total * sizeof(notorious_fft_real));
-        if (!temp) return;
-        /* No OpenMP — shared plan buffers are not thread-safe */
-        for (int n = 0; n < N2; n++)
-            notorious_fft_dst3(x + n*N1, temp + n*N1, a->sub1);
-        notorious_fft_real* col = (notorious_fft_real*)malloc((size_t)N2 * sizeof(notorious_fft_real));
-        if (col) {
-            for (int n = 0; n < N1; n++) {
-                for (int i = 0; i < N2; i++) col[i] = temp[n + i*N1];
-                notorious_fft_dst3(col, col, a->sub2);
-                for (int i = 0; i < N2; i++) y[n + i*N1] = col[i];
-            }
-        }
-        free(col);
-        free(temp);
+        notorious_fft_apply_mdrx(x, y, a, notorious_fft_dst3);
     } else {
         notorious_fft_s_dst3_1d(x, y, a);
     }
@@ -1334,55 +1317,20 @@ static void notorious_fft_s_t4_1d(notorious_fft_real* x, notorious_fft_real* y, 
 }
 
 void notorious_fft_dct4(notorious_fft_real* x, notorious_fft_real* y, const notorious_fft_aux* a) {
+    if (!a || !x || !y) return;
     if (a->plan || a->N == 1 || (a->e && a->t)) {
         notorious_fft_s_t4_1d(x, y, a, 0);
     } else if (a->sub2) {
-        /* Multi-dimensional */
-        int N1 = a->sub1 ? a->sub1->N : 1;
-        int N2 = a->sub2->N;
-        if (N1 == 1) { notorious_fft_dct4(x, y, a->sub2); return; }
-        int total = N1 * N2;
-        notorious_fft_real* temp = (notorious_fft_real*)malloc((size_t)total * sizeof(notorious_fft_real));
-        if (!temp) return;
-        /* No OpenMP — shared plan buffers are not thread-safe */
-        for (int n = 0; n < N2; n++)
-            notorious_fft_dct4(x + n*N1, temp + n*N1, a->sub1);
-        notorious_fft_real* col = (notorious_fft_real*)malloc((size_t)N2 * sizeof(notorious_fft_real));
-        if (col) {
-            for (int n = 0; n < N1; n++) {
-                for (int i = 0; i < N2; i++) col[i] = temp[n + i*N1];
-                notorious_fft_dct4(col, col, a->sub2);
-                for (int i = 0; i < N2; i++) y[n + i*N1] = col[i];
-            }
-        }
-        free(col);
-        free(temp);
+        notorious_fft_apply_mdrx(x, y, a, notorious_fft_dct4);
     }
 }
 
 void notorious_fft_dst4(notorious_fft_real* x, notorious_fft_real* y, const notorious_fft_aux* a) {
+    if (!a || !x || !y) return;
     if (a->plan || a->N == 1 || (a->e && a->t)) {
         notorious_fft_s_t4_1d(x, y, a, 1);
     } else if (a->sub2) {
-        int N1 = a->sub1 ? a->sub1->N : 1;
-        int N2 = a->sub2->N;
-        if (N1 == 1) { notorious_fft_dst4(x, y, a->sub2); return; }
-        int total = N1 * N2;
-        notorious_fft_real* temp = (notorious_fft_real*)malloc((size_t)total * sizeof(notorious_fft_real));
-        if (!temp) return;
-        /* No OpenMP — shared plan buffers are not thread-safe */
-        for (int n = 0; n < N2; n++)
-            notorious_fft_dst4(x + n*N1, temp + n*N1, a->sub1);
-        notorious_fft_real* col = (notorious_fft_real*)malloc((size_t)N2 * sizeof(notorious_fft_real));
-        if (col) {
-            for (int n = 0; n < N1; n++) {
-                for (int i = 0; i < N2; i++) col[i] = temp[n + i*N1];
-                notorious_fft_dst4(col, col, a->sub2);
-                for (int i = 0; i < N2; i++) y[n + i*N1] = col[i];
-            }
-        }
-        free(col);
-        free(temp);
+        notorious_fft_apply_mdrx(x, y, a, notorious_fft_dst4);
     }
 }
 
@@ -1416,6 +1364,13 @@ notorious_fft_aux* notorious_fft_mkaux_dft_1d(int N) {
     }
 
     notorious_fft_init_aux_from_plan(a);
+    /* Strided scatter scratch (N interleaved complexes) — no malloc at execute. */
+    a->scratch_re = (notorious_fft_real*)notorious_fft_malloc((size_t)N * 2 * sizeof(notorious_fft_real));
+    if (!a->scratch_re) {
+        notorious_fft_destroy_plan(a->plan);
+        free(a);
+        return NULL;
+    }
     return a;
 }
 
@@ -1498,13 +1453,19 @@ notorious_fft_aux* notorious_fft_mkaux_realdft(int d, int* Ns) {
 
         notorious_fft_aux* a = (notorious_fft_aux*)malloc(sizeof(notorious_fft_aux));
         if (!a) return NULL;
+        memset(a, 0, sizeof(*a));
 
         a->N = Ns[d-1] * p;
-        a->plan = NULL;
         a->sub1 = notorious_fft_mkaux_realdft_1d(Ns[d-1]);
         a->sub2 = notorious_fft_mkaux_dft(d - 1, Ns);
 
         if (!a->sub1 || !a->sub2) {
+            notorious_fft_free_aux(a);
+            return NULL;
+        }
+        /* Column scratch for complex DFTs of the first d-1 dims (p complexes). */
+        a->scratch_re = (notorious_fft_real*)notorious_fft_malloc((size_t)p * 2 * sizeof(notorious_fft_real));
+        if (!a->scratch_re) {
             notorious_fft_free_aux(a);
             return NULL;
         }
@@ -1677,6 +1638,14 @@ static notorious_fft_aux* notorious_fft_make_aux(int d, int* Ns, int datasz,
         }
         a->sub1 = notorious_fft_make_aux(d - 1, Ns + 1, datasz, aux_1d);
         a->sub2 = (*aux_1d)(Ns[0]);
+        if (datasz == (int)sizeof(notorious_fft_real) && Ns[0] > 0) {
+            a->scratch_re = (notorious_fft_real*)notorious_fft_malloc((size_t)Ns[0] * sizeof(notorious_fft_real));
+            a->scratch_im = (notorious_fft_real*)notorious_fft_malloc((size_t)Ns[0] * sizeof(notorious_fft_real));
+            if (!a->scratch_re || !a->scratch_im) {
+                notorious_fft_free_aux(a);
+                return NULL;
+            }
+        }
     }
 
     if ((d > 1 && !a->sub1) || !a->sub2) {

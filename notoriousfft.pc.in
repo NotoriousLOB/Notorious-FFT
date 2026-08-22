@@ -1,0 +1,7 @@
+prefix=@CMAKE_INSTALL_PREFIX@
+includedir=${prefix}/include
+
+Name: notoriousfft
+Description: Header-only FFT library with an FFTW-shaped planner API
+Version: 1.0.0
+Cflags: -I${includedir}

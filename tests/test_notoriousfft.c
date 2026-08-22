@@ -388,9 +388,59 @@ static void test_invdft_2d(int N1, int N2) {
 	free(mx); free(my); free(lx); free(ly);
 }
 
-/* NOTE: test_realdft_2d / test_realdft_3d are omitted — the notorious_fft_realdft
- * function does not yet implement a multi-dimensional dispatch path.
- * Only 1D real DFT is currently supported in the NotoriousFFT API. */
+static void test_realdft_2d(int N1, int N2) {
+	char name[64];
+	int nc = N2 / 2 + 1;
+	int nout = N1 * nc;
+	snprintf(name, sizeof(name), "realdft_2d %dx%d", N1, N2);
+
+	minfft_real *mx = malloc((size_t)(N1 * N2) * sizeof(minfft_real));
+	minfft_cmpl *my = malloc((size_t)nout * sizeof(minfft_cmpl));
+	notorious_fft_real *lx = malloc((size_t)(N1 * N2) * sizeof(notorious_fft_real));
+	notorious_fft_cmpl *ly = malloc((size_t)nout * sizeof(notorious_fft_cmpl));
+
+	fill(mx, N1 * N2);
+	memcpy(lx, mx, (size_t)(N1 * N2) * sizeof(minfft_real));
+
+	minfft_aux *ma = minfft_mkaux_realdft_2d(N1, N2);
+	notorious_fft_aux *la = notorious_fft_mkaux_realdft_2d(N1, N2);
+
+	minfft_realdft(mx, my, ma);
+	notorious_fft_realdft(lx, ly, la);
+
+	check(name, (double *)my, (double *)ly, 2 * nout);
+
+	minfft_free_aux(ma);
+	notorious_fft_free_aux(la);
+	free(mx); free(my); free(lx); free(ly);
+}
+
+static void test_invrealdft_2d(int N1, int N2) {
+	char name[64];
+	int N = N1 * N2;
+	snprintf(name, sizeof(name), "invrealdft_2d %dx%d", N1, N2);
+
+	minfft_real *mx = malloc((size_t)N * sizeof(minfft_real));
+	minfft_cmpl *mz = malloc((size_t)(N1 * (N2 / 2 + 1)) * sizeof(minfft_cmpl));
+	minfft_real *my = malloc((size_t)N * sizeof(minfft_real));
+	notorious_fft_cmpl *lz = malloc((size_t)(N1 * (N2 / 2 + 1)) * sizeof(notorious_fft_cmpl));
+	notorious_fft_real *ly = malloc((size_t)N * sizeof(notorious_fft_real));
+
+	fill(mx, N);
+	minfft_aux *ma = minfft_mkaux_realdft_2d(N1, N2);
+	minfft_realdft(mx, mz, ma);
+	memcpy(lz, mz, (size_t)(N1 * (N2 / 2 + 1)) * sizeof(minfft_cmpl));
+	minfft_invrealdft(mz, my, ma);
+
+	notorious_fft_aux *la = notorious_fft_mkaux_realdft_2d(N1, N2);
+	notorious_fft_invrealdft(lz, ly, la);
+
+	check(name, my, ly, N);
+
+	minfft_free_aux(ma);
+	notorious_fft_free_aux(la);
+	free(mx); free(mz); free(my); free(lz); free(ly);
+}
 
 static void test_dst2_2d(int N1, int N2) {
 	char name[64];
@@ -669,8 +719,109 @@ static void test_dft_bluestein(int N) {
 	free(lx); free(ly); free(ref_interleaved);
 }
 
+static void ref_idft(const double* xr, const double* xi, double* yr, double* yi, int N) {
+	/* Unnormalized inverse: +2π kn/N, no 1/N */
+	for (int k = 0; k < N; k++) {
+		double sr = 0, si = 0;
+		for (int n = 0; n < N; n++) {
+			double angle = 2.0 * M_PI * k * n / N;
+			double c = cos(angle), s = sin(angle);
+			sr += xr[n] * c - xi[n] * s;
+			si += xr[n] * s + xi[n] * c;
+		}
+		yr[k] = sr;
+		yi[k] = si;
+	}
+}
+
+static void test_invdft_bluestein(int N) {
+	char name[64];
+	snprintf(name, sizeof(name), "invdft_bluestein N=%d", N);
+
+	double *xr = malloc((size_t)N * sizeof(double));
+	double *xi = malloc((size_t)N * sizeof(double));
+	double *ref_yr = malloc((size_t)N * sizeof(double));
+	double *ref_yi = malloc((size_t)N * sizeof(double));
+	notorious_fft_cmpl *lx = malloc((size_t)N * sizeof(notorious_fft_cmpl));
+	notorious_fft_cmpl *ly = malloc((size_t)N * sizeof(notorious_fft_cmpl));
+
+	fill(xr, N);
+	for (int i = 0; i < N; i++) xi[i] = sin(i * 2.71828 + 0.5);
+	for (int i = 0; i < N; i++) {
+		((double*)lx)[2*i]   = xr[i];
+		((double*)lx)[2*i+1] = xi[i];
+	}
+
+	ref_idft(xr, xi, ref_yr, ref_yi, N);
+
+	notorious_fft_aux *la = notorious_fft_mkaux_dft_1d(N);
+	notorious_fft_invdft(lx, ly, la);
+
+	double *ref_interleaved = malloc(2 * (size_t)N * sizeof(double));
+	for (int i = 0; i < N; i++) {
+		ref_interleaved[2*i]   = ref_yr[i];
+		ref_interleaved[2*i+1] = ref_yi[i];
+	}
+
+	double e = max_err(ref_interleaved, (double*)ly, 2 * N);
+	if (e < 1e-9) {
+		printf("  PASS: %-30s (max_err=%.2e)\n", name, e);
+		tests_passed++;
+	} else {
+		printf("  FAIL: %-30s (max_err=%.2e)\n", name, e);
+		tests_failed++;
+	}
+
+	notorious_fft_free_aux(la);
+	free(xr); free(xi); free(ref_yr); free(ref_yi);
+	free(lx); free(ly); free(ref_interleaved);
+}
+
+static void test_roundtrip_1d(int N) {
+	char name[64];
+	snprintf(name, sizeof(name), "roundtrip_dft N=%d", N);
+
+	notorious_fft_cmpl *x = malloc((size_t)N * sizeof(notorious_fft_cmpl));
+	notorious_fft_cmpl *y = malloc((size_t)N * sizeof(notorious_fft_cmpl));
+	notorious_fft_cmpl *z = malloc((size_t)N * sizeof(notorious_fft_cmpl));
+	fill((double*)x, 2 * N);
+
+	notorious_fft_aux *a = notorious_fft_mkaux_dft_1d(N);
+	notorious_fft_dft(x, y, a);
+	notorious_fft_invdft(y, z, a);
+
+	double e = 0;
+	for (int i = 0; i < N; i++) {
+		double dr = ((double*)z)[2*i]     - ((double*)x)[2*i]     * N;
+		double di = ((double*)z)[2*i + 1] - ((double*)x)[2*i + 1] * N;
+		double d = fabs(dr);
+		if (fabs(di) > d) d = fabs(di);
+		if (d > e) e = d;
+	}
+	double tol = (N >= 64) ? 1e-8 : 1e-9;
+	if (e < tol) {
+		printf("  PASS: %-30s (max_err=%.2e)\n", name, e);
+		tests_passed++;
+	} else {
+		printf("  FAIL: %-30s (max_err=%.2e)\n", name, e);
+		tests_failed++;
+	}
+	notorious_fft_free_aux(a);
+	free(x); free(y); free(z);
+}
+
+static void test_null_aux(void) {
+	notorious_fft_cmpl x[4], y[4];
+	memset(x, 0, sizeof x);
+	memset(y, 0, sizeof y);
+	notorious_fft_dft(x, y, NULL);
+	notorious_fft_invdft(x, y, NULL);
+	printf("  PASS: %-30s\n", "null_aux_noop");
+	tests_passed++;
+}
+
 int main(void) {
-	int sizes[] = {1, 2, 4, 8, 16, 32, 64, 128, 256, 1024};
+	int sizes[] = {1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048};
 	int nsizes = sizeof(sizes) / sizeof(sizes[0]);
 
 	printf("=== Complex DFT ===\n");
@@ -718,6 +869,16 @@ int main(void) {
 	test_dft_2d(8, 16);
 	test_dft_2d(32, 32);
 
+	printf("\n=== 2D Real DFT ===\n");
+	test_realdft_2d(4, 4);
+	test_realdft_2d(8, 16);
+	test_realdft_2d(32, 32);
+
+	printf("\n=== 2D Inverse Real DFT ===\n");
+	test_invrealdft_2d(4, 4);
+	test_invrealdft_2d(8, 16);
+	test_invrealdft_2d(32, 32);
+
 	printf("\n=== 2D Inverse Complex DFT ===\n");
 	test_invdft_2d(4, 4);
 	test_invdft_2d(8, 16);
@@ -761,16 +922,105 @@ int main(void) {
 	test_invdft_3d(4, 4, 4);
 	test_invdft_3d(4, 8, 8);
 
+	printf("\n=== Large power-of-2 ===\n");
+	test_dft_1d(65536);
+	test_invdft_1d(65536);
+
 	printf("\n=== 3D DCT-2 ===\n");
 	test_dct2_3d(4, 4, 4);
 	test_dct2_3d(4, 8, 8);
 
 	printf("\n=== Non-Power-of-2 / Bluestein DFT ===\n");
 	{
-		int bluestein_sizes[] = {3, 5, 6, 7, 10, 12, 15, 20, 100};
+		int bluestein_sizes[] = {3, 5, 6, 7, 9, 10, 12, 14, 15, 18, 20, 21, 25, 27, 35, 48, 49, 100};
 		int nb = sizeof(bluestein_sizes) / sizeof(bluestein_sizes[0]);
 		for (int i = 0; i < nb; i++)
 			test_dft_bluestein(bluestein_sizes[i]);
+	}
+
+	printf("\n=== Inverse Bluestein (unnormalized) ===\n");
+	{
+		int bluestein_sizes[] = {3, 5, 6, 7, 9, 10, 12, 14, 15, 18, 20, 21, 25, 27, 35, 48, 49, 100};
+		int nb = sizeof(bluestein_sizes) / sizeof(bluestein_sizes[0]);
+		for (int i = 0; i < nb; i++)
+			test_invdft_bluestein(bluestein_sizes[i]);
+	}
+
+	printf("\n=== Prime / Rader (incl. Mersenne 31,127 and Fermat 17,257) ===\n");
+	{
+		/* 11,13,17,19,31,37,61,127,257: N−1 is 2·3·5·7-smooth → Rader.
+		 * 23,67: N−1 not smooth → Bluestein. 255=3·5·17 mixed+Rader. */
+		int prime_sizes[] = {11, 13, 17, 19, 23, 31, 37, 61, 67, 127, 255, 257};
+		int np = sizeof(prime_sizes) / sizeof(prime_sizes[0]);
+		for (int i = 0; i < np; i++)
+			test_dft_bluestein(prime_sizes[i]);
+		for (int i = 0; i < np; i++)
+			test_invdft_bluestein(prime_sizes[i]);
+	}
+
+	printf("\n=== Mersenne identification (bit test, not a padded 2^p DFT) ===\n");
+	{
+		int ok = notorious_fft_is_mersenne_number(31)
+		      && notorious_fft_is_mersenne_number(127)
+		      && notorious_fft_is_mersenne_number(7)
+		      && !notorious_fft_is_mersenne_number(32)
+		      && !notorious_fft_is_mersenne_number(30)
+		      && notorious_fft_is_mersenne_number(15) /* 2^4-1, composite */
+		      && notorious_fft_is_prime(31)
+		      && !notorious_fft_is_prime(15);
+		if (ok) {
+			printf("  PASS: %-30s\n", "mersenne_bits");
+			tests_passed++;
+		} else {
+			printf("  FAIL: %-30s\n", "mersenne_bits");
+			tests_failed++;
+		}
+	}
+
+	printf("\n=== Round-trip DFT -> IDFT / N ===\n");
+	{
+		int rt[] = {8, 16, 64, 7, 12, 17, 31, 100, 127};
+		int nrt = sizeof(rt) / sizeof(rt[0]);
+		for (int i = 0; i < nrt; i++)
+			test_roundtrip_1d(rt[i]);
+	}
+
+	printf("\n=== Error policy ===\n");
+	test_null_aux();
+	if (notorious_fft_mkaux_dft_1d(0) == NULL &&
+	    notorious_fft_mkaux_dft_1d(-1) == NULL) {
+		printf("  PASS: %-30s\n", "mkaux_dft_1d rejects N<=0");
+		tests_passed++;
+	} else {
+		printf("  FAIL: %-30s\n", "mkaux_dft_1d rejects N<=0");
+		tests_failed++;
+	}
+
+	printf("\n=== FFTW-shaped planner API ===\n");
+	{
+		int N = 64;
+		notorious_fft_cmpl *in = (notorious_fft_cmpl *)notorious_fft_malloc((size_t)N * sizeof(notorious_fft_cmpl));
+		notorious_fft_cmpl *out = (notorious_fft_cmpl *)notorious_fft_malloc((size_t)N * sizeof(notorious_fft_cmpl));
+		notorious_fft_cmpl *ref = (notorious_fft_cmpl *)malloc((size_t)N * sizeof(notorious_fft_cmpl));
+		fill((double *)in, 2 * N);
+		memcpy(ref, in, (size_t)N * sizeof(notorious_fft_cmpl));
+
+		notorious_fft_io_plan *p = notorious_fft_plan_dft_1d(N, in, out, NOTORIOUS_FFT_FORWARD, NOTORIOUS_FFT_ESTIMATE);
+		notorious_fft_execute(p);
+
+		notorious_fft_aux *a = notorious_fft_mkaux_dft_1d(N);
+		notorious_fft_dft(ref, ref, a);
+
+		check("plan_dft_1d execute", (double *)ref, (double *)out, 2 * N);
+
+		notorious_fft_execute_dft(p, in, out); /* new-array, same buffers */
+		check("execute_dft new-array", (double *)ref, (double *)out, 2 * N);
+
+		notorious_fft_destroy_io_plan(p);
+		notorious_fft_free_aux(a);
+		notorious_fft_free(in);
+		notorious_fft_free(out);
+		free(ref);
 	}
 
 	printf("\n========================================\n");

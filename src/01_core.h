@@ -13,6 +13,13 @@
 #include <stdint.h>
 #include <time.h>
 
+#define NOTORIOUS_FFT_VERSION_MAJOR 1
+#define NOTORIOUS_FFT_VERSION_MINOR 0
+#define NOTORIOUS_FFT_VERSION_PATCH 0
+#define NOTORIOUS_FFT_VERSION_STRING "1.0.0"
+
+#define NOTORIOUS_FFT_ALIGNMENT 64
+
 /* ============================================================================
  * Configuration
  * ============================================================================ */
@@ -27,6 +34,11 @@
 
 #ifndef NOTORIOUS_FFT_TIMING_RUNS
 #define NOTORIOUS_FFT_TIMING_RUNS 3  /* Runs for timing-based selection */
+#endif
+
+#ifndef NOTORIOUS_FFT_FOURSTEP_MIN
+/* Three transposes of N complexes dominate below ~2^20; recursive split-radix wins at 64K. */
+#define NOTORIOUS_FFT_FOURSTEP_MIN 1048576
 #endif
 
 /* ============================================================================
@@ -77,6 +89,26 @@ typedef struct notorious_fft_plan {
     notorious_fft_real *sr_e;      /* Split-radix exponent table — same layout as minfft */
     notorious_fft_real *sr_t;      /* Temp buffer for split-radix (n complex = 2*n reals) */
 
+    /* Mixed-radix Cooley–Tukey (N = radix × m, radix ∈ {3,5,7}) */
+    int mixed_radix;        /* 0 = not mixed-radix */
+    struct notorious_fft_plan *mixed_sub;  /* Plan for length m = n/radix */
+
+    /* Rader: prime N with (N-1) 2·3·5·7-smooth. Convolution length N-1. */
+    struct notorious_fft_plan *rader_sub;
+    int *rader_in;                 /* g^j mod N, length N-1 */
+    int *rader_out;                /* g^{-j} mod N, length N-1 */
+    notorious_fft_real *rader_b_re;  /* FFT_{N-1} of ω^{g^{-j}} */
+    notorious_fft_real *rader_b_im;
+
+    /* MEASURE: prefer_iterative / prefer_dit (0 = split-radix DIF, the ESTIMATE default) */
+    int prefer_iterative;
+    int prefer_dit;
+
+    /* Four-step (N = n1 × n2) for large power-of-two transforms */
+    int four_n1, four_n2;
+    struct notorious_fft_plan *four_sub1, *four_sub2;
+    notorious_fft_real *four_tw_re, *four_tw_im;
+
     /* For Bluestein algorithm (non-power-of-2) */
     size_t bluestein_n;     /* Next power of 2 >= 2*n-1 */
     int is_inverse;         /* 1 for inverse FFT, 0 for forward */
@@ -122,6 +154,16 @@ typedef struct notorious_fft_aux {
     #else
         #define NOTORIOUS_FFT_RESTRICT restrict
     #endif
+#endif
+
+#ifndef NOTORIOUS_FFT_PREFETCH
+#if defined(_MSC_VER)
+    #define NOTORIOUS_FFT_PREFETCH(p) _mm_prefetch((const char*)(p), _MM_HINT_T0)
+#elif defined(__GNUC__) || defined(__clang__)
+    #define NOTORIOUS_FFT_PREFETCH(p) __builtin_prefetch((p), 0, 3)
+#else
+    #define NOTORIOUS_FFT_PREFETCH(p) ((void)0)
+#endif
 #endif
 
 /* SIMD Detection */
