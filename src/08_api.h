@@ -69,6 +69,15 @@ notorious_fft_io_plan *notorious_fft_plan_dft_3d(int n0, int n1, int n2, notorio
 notorious_fft_io_plan *notorious_fft_plan_dft(int rank, const int *n, notorious_fft_cmpl *in, notorious_fft_cmpl *out,
                                               int sign, unsigned flags);
 
+/* Real DFTs accept positive lengths in every size class, subject to checked
+ * object/index bounds and allocation success. R2C uses exp(-2*pi*i*j*k/N);
+ * C2R uses the positive sign and is unnormalized (round trip = product(N)).
+ * Packed output is row-major with floor(n_last/2)+1 complex bins per row.
+ * In-place arrays need 2*(floor(n_last/2)+1) real slots per physical row;
+ * disjoint real arrays are dense. Partial overlap is unsupported. Execution
+ * preserves disjoint input, supports replacement arrays, and allocates no
+ * memory. Per-plan scratch requires caller synchronization for shared plans.
+ * Flags are estimate-like. See docs/real-dft.md for the Hermitian contract. */
 notorious_fft_io_plan *notorious_fft_plan_dft_r2c_1d(int n, notorious_fft_real *in, notorious_fft_cmpl *out,
                                                      unsigned flags);
 notorious_fft_io_plan *notorious_fft_plan_dft_c2r_1d(int n, notorious_fft_cmpl *in, notorious_fft_real *out,
@@ -179,72 +188,53 @@ notorious_fft_io_plan *notorious_fft_plan_dft_3d(int n0, int n1, int n2, notorio
     return notorious_fft_plan_dft(3, ns, in, out, sign, flags);
 }
 
-notorious_fft_io_plan *notorious_fft_plan_dft_r2c_1d(int n, notorious_fft_real *in, notorious_fft_cmpl *out,
-                                                     unsigned flags) {
-    if (n <= 0) return NULL;
+/* Real plans validate both logical and physically packed object sizes before
+ * allocation. Legacy multidimensional auxiliaries store logical counts in int. */
+static notorious_fft_io_plan *notorious_fft_plan_real(int rank, const int *n, void *in, void *out,
+                                                      int inverse, unsigned flags) {
+    size_t count = 1, packed_count, bytes;
+    for (int i = 0; i < rank; ++i) {
+        if (n[i] <= 0 || !notorious_fft_size_mul(count, (size_t)n[i], &count) || count > INT_MAX)
+            return NULL;
+    }
+    size_t rows = rank == 1 ? 1 : (size_t)n[0];
+    if (!notorious_fft_size_mul(rows, (size_t)n[rank-1]/2+1, &packed_count) ||
+        !notorious_fft_size_mul(packed_count, sizeof(notorious_fft_cmpl), &bytes) ||
+        !notorious_fft_size_mul(count, sizeof(notorious_fft_real), &bytes)) return NULL;
     notorious_fft_io_plan *p = notorious_fft_io_plan_new();
     if (!p) return NULL;
-    p->rank = 1;
-    p->n[0] = n;
-    p->sign = NOTORIOUS_FFT_FORWARD;
+    p->rank = rank;
+    for (int i = 0; i < rank; ++i) p->n[i] = n[i];
+    p->sign = inverse ? NOTORIOUS_FFT_BACKWARD : NOTORIOUS_FFT_FORWARD;
     p->flags = flags;
-    p->kind = NOTORIOUS_FFT_IO_R2C;
+    p->kind = inverse ? NOTORIOUS_FFT_IO_C2R : NOTORIOUS_FFT_IO_R2C;
     p->in = in;
     p->out = out;
-    p->aux = notorious_fft_mkaux_realdft_1d(n);
-    if (!p->aux) { free(p); return NULL; }
+    p->aux = rank == 1 ? notorious_fft_mkaux_realdft_1d(n[0]) : notorious_fft_mkaux_realdft_2d(n[0], n[1]);
+    if (!p->aux) { notorious_fft_destroy_io_plan(p); return NULL; }
     return p;
+}
+
+notorious_fft_io_plan *notorious_fft_plan_dft_r2c_1d(int n, notorious_fft_real *in, notorious_fft_cmpl *out,
+                                                     unsigned flags) {
+    return notorious_fft_plan_real(1, &n, in, out, 0, flags);
 }
 
 notorious_fft_io_plan *notorious_fft_plan_dft_c2r_1d(int n, notorious_fft_cmpl *in, notorious_fft_real *out,
                                                      unsigned flags) {
-    if (n <= 0) return NULL;
-    notorious_fft_io_plan *p = notorious_fft_io_plan_new();
-    if (!p) return NULL;
-    p->rank = 1;
-    p->n[0] = n;
-    p->sign = NOTORIOUS_FFT_BACKWARD;
-    p->flags = flags;
-    p->kind = NOTORIOUS_FFT_IO_C2R;
-    p->in = in;
-    p->out = out;
-    p->aux = notorious_fft_mkaux_realdft_1d(n);
-    if (!p->aux) { free(p); return NULL; }
-    return p;
+    return notorious_fft_plan_real(1, &n, in, out, 1, flags);
 }
 
 notorious_fft_io_plan *notorious_fft_plan_dft_r2c_2d(int n0, int n1, notorious_fft_real *in, notorious_fft_cmpl *out,
                                                      unsigned flags) {
-    if (n0 <= 0 || n1 <= 0) return NULL;
-    notorious_fft_io_plan *p = notorious_fft_io_plan_new();
-    if (!p) return NULL;
-    p->rank = 2;
-    p->n[0] = n0;
-    p->n[1] = n1;
-    p->kind = NOTORIOUS_FFT_IO_R2C;
-    p->flags = flags;
-    p->in = in;
-    p->out = out;
-    p->aux = notorious_fft_mkaux_realdft_2d(n0, n1);
-    if (!p->aux) { free(p); return NULL; }
-    return p;
+    const int ns[2] = {n0, n1};
+    return notorious_fft_plan_real(2, ns, in, out, 0, flags);
 }
 
 notorious_fft_io_plan *notorious_fft_plan_dft_c2r_2d(int n0, int n1, notorious_fft_cmpl *in, notorious_fft_real *out,
                                                      unsigned flags) {
-    if (n0 <= 0 || n1 <= 0) return NULL;
-    notorious_fft_io_plan *p = notorious_fft_io_plan_new();
-    if (!p) return NULL;
-    p->rank = 2;
-    p->n[0] = n0;
-    p->n[1] = n1;
-    p->kind = NOTORIOUS_FFT_IO_C2R;
-    p->flags = flags;
-    p->in = in;
-    p->out = out;
-    p->aux = notorious_fft_mkaux_realdft_2d(n0, n1);
-    if (!p->aux) { free(p); return NULL; }
-    return p;
+    const int ns[2] = {n0, n1};
+    return notorious_fft_plan_real(2, ns, in, out, 1, flags);
 }
 
 static notorious_fft_aux *notorious_fft_aux_for_r2r(int n, notorious_fft_r2r_kind k) {
@@ -396,23 +386,12 @@ void notorious_fft_execute_dft(const notorious_fft_io_plan *p, notorious_fft_cmp
 }
 
 void notorious_fft_execute_dft_r2c(const notorious_fft_io_plan *p, notorious_fft_real *in, notorious_fft_cmpl *out) {
-    if (!p || !p->aux || !in || !out) return;
+    if (!p || p->kind != NOTORIOUS_FFT_IO_R2C || !p->aux || !in || !out) return;
     notorious_fft_realdft(in, out, p->aux);
 }
 
 void notorious_fft_execute_dft_c2r(const notorious_fft_io_plan *p, notorious_fft_cmpl *in, notorious_fft_real *out) {
-    if (!p || !p->aux || !in || !out) return;
-    if ((p->flags & NOTORIOUS_FFT_PRESERVE_INPUT) && in == (notorious_fft_cmpl *)p->in) {
-        /* Preserve by copying into aux scratch when possible. */
-        int n = p->n[0];
-        size_t bins = (size_t)(n / 2 + 1);
-        notorious_fft_cmpl *tmp = (notorious_fft_cmpl *)p->aux->scratch_re;
-        if (tmp && p->rank == 1) {
-            memcpy(tmp, in, bins * sizeof(notorious_fft_cmpl));
-            notorious_fft_invrealdft(tmp, out, p->aux);
-            return;
-        }
-    }
+    if (!p || p->kind != NOTORIOUS_FFT_IO_C2R || !p->aux || !in || !out) return;
     notorious_fft_invrealdft(in, out, p->aux);
 }
 

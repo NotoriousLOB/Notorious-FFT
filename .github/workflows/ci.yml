@@ -48,6 +48,8 @@ jobs:
               -c tests/implementation_r2r.c -o "build/implementation_${isa}.o"
             "$CC" "${common[@]}" "${simd[@]}" -std=c11 -DNOTORIOUS_FFT_IMPLEMENTATION \
               -c tests/test_r2r_memory.c -o "build/memory_${isa}.o"
+            "$CC" "${common[@]}" "${simd[@]}" -std=c11 -DNOTORIOUS_FFT_IMPLEMENTATION \
+              -c tests/test_real_dft.c -o "build/real_dft_${isa}.o"
             "$CXX" "${common[@]}" "${simd[@]}" -std=c++17 -DNOTORIOUS_FFT_IMPLEMENTATION \
               -c tests/consumer_r2r.cpp -o "build/consumer_${isa}_cpp.o"
             "$CXX" "${common[@]}" "${simd[@]}" -std=c++17 \

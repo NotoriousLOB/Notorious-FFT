@@ -81,6 +81,11 @@ static void *construct(int which) {
     case 14: return notorious_fft_mkaux_dft_1d(128); /* four-step in this test */
     case 15: return notorious_fft_plan_r2r_1d(1,input,output,NOTORIOUS_FFT_REDFT10,0);
     case 16: return notorious_fft_plan_r2r_1d(2,input,input,NOTORIOUS_FFT_RODFT10,UINT_MAX);
+    case 17: return notorious_fft_plan_dft_r2c_1d(23,input,(notorious_fft_cmpl*)output,0);
+    case 18: return notorious_fft_plan_dft_c2r_1d(17,(notorious_fft_cmpl*)input,output,NOTORIOUS_FFT_PRESERVE_INPUT);
+    case 19: return notorious_fft_plan_dft_r2c_2d(3,5,input,(notorious_fft_cmpl*)input,0);
+    case 20: return notorious_fft_plan_dft_c2r_2d(7,6,(notorious_fft_cmpl*)input,output,NOTORIOUS_FFT_PRESERVE_INPUT);
+    case 21: return notorious_fft_plan_dft_c2r_1d(6,(notorious_fft_cmpl*)input,input,0);
     default: abort();
     }
 }
@@ -97,9 +102,13 @@ static void execute(int which, void *p) {
         notorious_fft_dct2(input,output,(notorious_fft_aux*)p);
         notorious_fft_dct3(output,output,(notorious_fft_aux*)p);
     } else if (which == 8) notorious_fft_dst4(input,output,(notorious_fft_aux*)p);
+    else if (which == 9 || which == 10) {
+        notorious_fft_realdft(input,(notorious_fft_cmpl*)output,(notorious_fft_aux*)p);
+        notorious_fft_invrealdft((notorious_fft_cmpl*)output,input,(notorious_fft_aux*)p);
+    }
 }
 static void injection(void) {
-    for (int which = 0; which < 17; ++which) {
+    for (int which = 0; which < 22; ++which) {
         attempts = 0; fail_at = 0;
         double before[2048];
         memcpy(before,input,sizeof(input));
@@ -133,6 +142,10 @@ static void injection(void) {
 static void invalid(void) {
     REJECT(fftw_plan_r2r_1d(0,input,output,FFTW_REDFT10,0),"invalid dimension");
     REJECT(fftw_plan_r2r_1d(-1,input,output,FFTW_REDFT01,0),"invalid dimension");
+    REJECT(fftw_plan_dft_r2c_1d(0,input,(fftw_complex*)output,0),"invalid real dimension");
+    REJECT(fftw_plan_dft_c2r_1d(-1,(fftw_complex*)input,output,0),"invalid real dimension");
+    REJECT(fftw_plan_dft_r2c_2d(INT_MAX,2,input,(fftw_complex*)output,0),"real tensor count overflow");
+    REJECT(fftw_plan_dft_c2r_2d(INT_MAX,INT_MAX,(fftw_complex*)input,output,0),"real tensor count overflow");
     REJECT(fftw_plan_r2r_2d(8,-3,input,output,FFTW_REDFT10,FFTW_REDFT10,0),"invalid dimension");
     REJECT(fftw_plan_r2r_3d(1,0,1,input,output,FFTW_REDFT10,FFTW_REDFT10,FFTW_REDFT10,0),"invalid dimension");
     for (int k = -2; k < 14; ++k) {
@@ -168,6 +181,15 @@ static void invalid(void) {
     fftw_destroy_plan(p);
     REQUIRE(!live_count);
     fftw_execute(NULL); fftw_destroy_plan(NULL); notorious_fft_free_aux(NULL);
+    p=fftw_plan_dft_r2c_1d(7,NULL,NULL,0);
+    REQUIRE(p);
+    fftw_execute(p);
+    fftw_execute_dft_r2c(p,input,(fftw_complex*)output);
+    double before[2048]; memcpy(before,output,sizeof(output));
+    fftw_execute_dft_c2r(p,(fftw_complex*)input,output); /* wrong plan kind */
+    REQUIRE(!memcmp(before,output,sizeof(output)));
+    fftw_destroy_plan(p);
+    REQUIRE(!live_count);
 }
 
 int main(void) {

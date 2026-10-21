@@ -19,7 +19,12 @@ Notorious FFT provides complex Fourier and cosine/sine transforms in a single he
 - **Any complex DFT size**: split-radix for powers of two, mixed-radix 3/5/7, Rader for primes with smooth N−1, Bluestein otherwise
 - **SIMD**: NEON, AVX2, AVX-512 selected at compile time (not stubs)
 - **Single and double precision**: define `NOTORIOUS_FFT_SINGLE` for float, default is double
-- **Version**: 1.1.0 (`NOTORIOUS_FFT_VERSION_*`)
+- **Version**: 1.1.1 (`NOTORIOUS_FFT_VERSION_*`)
+
+v1.1.1 extends 1D/2D R2C and C2R planning to prime, odd, and composite
+lengths, fixes padded in-place real layouts, and preserves disjoint C2R
+input. Packing, signs, Hermitian symmetry, and inverse scales are checked
+against direct DFT formulas and FFTW3; see [the real-DFT contract](docs/real-dft.md).
 
 v1.1.0 adds arbitrary-length DCT-II/III and native row-major 2D/3D r2r
 plans with independent kinds per axis. It hardens planning failure cleanup,
@@ -130,7 +135,8 @@ restrictions, and aliasing rules are documented in [docs/r2r.md](docs/r2r.md).
 Other existing data-layout conventions include:
 - Complex data is stored as interleaved real/imaginary pairs (`double[2]`)
 - Real DFT output has `N/2+1` complex elements
-- Multi-dimensional inverse real DFT does not preserve its input
+- Disjoint real-DFT input is preserved in both directions; in-place real rows
+  require FFTW-style padding as documented in [docs/real-dft.md](docs/real-dft.md)
 
 ## Building
 

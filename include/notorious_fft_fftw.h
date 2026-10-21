@@ -16,6 +16,8 @@
  * r2r planning flags are estimate-like; no timing search is performed.
  * 1D complex DFT MEASURE/PATIENT may time existing power-of-two kernels.
  * See docs/r2r.md for lengths, layout, aliasing and the tested subset.
+ * R2C/C2R accept arbitrary size classes; see docs/real-dft.md for packing,
+ * Hermitian symmetry, padded in-place layouts, and numerical validation.
  * Inverse transforms are unnormalized, matching FFTW.
  */
 

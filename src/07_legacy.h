@@ -173,15 +173,18 @@ void notorious_fft_realdft(notorious_fft_real* x, notorious_fft_cmpl* z, const n
         int howmany = (n_last > 0) ? (a->N / n_last) : 0;
         notorious_fft_cmpl *col = (notorious_fft_cmpl *)a->scratch_re;
         if (howmany <= 0 || !col) return;
+        notorious_fft_cmpl *packed = (notorious_fft_cmpl *)a->t;
+        size_t real_stride = (void*)x == (void*)z ? (size_t)2 * nc : (size_t)n_last;
         for (int i = 0; i < howmany; i++)
-            notorious_fft_realdft(x + i * n_last, z + i * nc, a->sub1);
+            notorious_fft_realdft(x + (size_t)i * real_stride, packed + (size_t)i * nc, a->sub1);
         for (int k = 0; k < nc; k++) {
             for (int i = 0; i < howmany; i++)
-                memcpy(&col[i], &z[i * nc + k], sizeof(notorious_fft_cmpl));
+                memcpy(&col[i], &packed[(size_t)i * nc + k], sizeof(notorious_fft_cmpl));
             notorious_fft_dft(col, col, a->sub2);
             for (int i = 0; i < howmany; i++)
-                memcpy(&z[i * nc + k], &col[i], sizeof(notorious_fft_cmpl));
+                memcpy(&packed[(size_t)i * nc + k], &col[i], sizeof(notorious_fft_cmpl));
         }
+        memcpy(z, packed, (size_t)howmany * nc * sizeof(notorious_fft_cmpl));
         return;
     }
 
@@ -198,6 +201,18 @@ void notorious_fft_realdft(notorious_fft_real* x, notorious_fft_cmpl* z, const n
         ((notorious_fft_real*)z)[1] = 0;
         ((notorious_fft_real*)z)[2] = t1;
         ((notorious_fft_real*)z)[3] = 0;
+        return;
+    }
+
+    if (N & (N - 1)) {
+        /* General lengths use an N-point complex FFT, reusing its arbitrary
+         * radix/Rader/Bluestein planning and a single interleaved work line. */
+        notorious_fft_real *work = (notorious_fft_real*)a->t;
+        for (int j = 0; j < N; ++j) { work[2*(size_t)j] = x[j]; work[2*(size_t)j+1] = 0; }
+        notorious_fft_execute_cx(a->plan, work, work, 0);
+        memcpy(z, work, ((size_t)N/2+1) * sizeof(notorious_fft_cmpl));
+        ((notorious_fft_real*)z)[1] = 0;
+        if (N % 2 == 0) ((notorious_fft_real*)z)[(size_t)N+1] = 0;
         return;
     }
 
@@ -270,15 +285,18 @@ void notorious_fft_invrealdft(notorious_fft_cmpl* z, notorious_fft_real* y, cons
         int howmany = (n_last > 0) ? (a->N / n_last) : 0;
         notorious_fft_cmpl *col = (notorious_fft_cmpl *)a->scratch_re;
         if (howmany <= 0 || !col) return;
+        notorious_fft_cmpl *packed = (notorious_fft_cmpl *)a->t;
+        memcpy(packed, z, (size_t)howmany * nc * sizeof(notorious_fft_cmpl));
         for (int k = 0; k < nc; k++) {
             for (int i = 0; i < howmany; i++)
-                memcpy(&col[i], &z[i * nc + k], sizeof(notorious_fft_cmpl));
+                memcpy(&col[i], &packed[(size_t)i * nc + k], sizeof(notorious_fft_cmpl));
             notorious_fft_invdft(col, col, a->sub2);
             for (int i = 0; i < howmany; i++)
-                memcpy(&z[i * nc + k], &col[i], sizeof(notorious_fft_cmpl));
+                memcpy(&packed[(size_t)i * nc + k], &col[i], sizeof(notorious_fft_cmpl));
         }
+        size_t real_stride = (void*)y == (void*)z ? (size_t)2 * nc : (size_t)n_last;
         for (int i = 0; i < howmany; i++)
-            notorious_fft_invrealdft(z + i * nc, y + i * n_last, a->sub1);
+            notorious_fft_invrealdft(packed + (size_t)i * nc, y + (size_t)i * real_stride, a->sub1);
         return;
     }
 
@@ -292,6 +310,21 @@ void notorious_fft_invrealdft(notorious_fft_cmpl* z, notorious_fft_real* y, cons
         notorious_fft_real t1 = ((notorious_fft_real*)z)[2];
         y[0] = t0 + t1;
         y[1] = t0 - t1;
+        return;
+    }
+
+    if (N & (N - 1)) {
+        notorious_fft_real *work = (notorious_fft_real*)a->t;
+        size_t bins = (size_t)N/2+1;
+        memcpy(work, z, bins * sizeof(notorious_fft_cmpl));
+        work[1] = 0; /* DC and (only for even N) Nyquist are real. */
+        if (N % 2 == 0) work[(size_t)N+1] = 0;
+        for (size_t k = 1; k <= ((size_t)N-1)/2; ++k) {
+            work[2*((size_t)N-k)] = work[2*k];
+            work[2*((size_t)N-k)+1] = -work[2*k+1];
+        }
+        notorious_fft_execute_cx(a->plan, work, work, 1);
+        for (int j = 0; j < N; ++j) y[j] = work[2*(size_t)j];
         return;
     }
 
@@ -1444,14 +1477,23 @@ notorious_fft_aux* notorious_fft_mkaux_dft_3d(int N1, int N2, int N3) {
 /* Precompute realdft twiddles and scratch buffers */
 notorious_fft_aux* notorious_fft_mkaux_realdft_1d(int N) {
     size_t bytes;
-    if (N <= 0 || (N & (N - 1)) ||
+    if (N <= 0 ||
         !notorious_fft_size_mul((size_t)N, sizeof(notorious_fft_real), &bytes)) return NULL;
 
-    notorious_fft_aux* a = (notorious_fft_aux*)malloc(sizeof(notorious_fft_aux));
+    notorious_fft_aux* a = (notorious_fft_aux*)calloc(1, sizeof(notorious_fft_aux));
     if (!a) return NULL;
 
     a->N = N;
     notorious_fft_init_aux_from_plan(a);
+
+    if (N & (N - 1)) {
+        if (!notorious_fft_size_mul((size_t)N, sizeof(notorious_fft_cmpl), &bytes)) goto fail;
+        a->plan = notorious_fft_create_plan((size_t)N, 0);
+        if (!a->plan) goto fail;
+        a->t = notorious_fft_malloc(bytes);
+        if (!a->t) goto fail;
+        return a;
+    }
 
     if (N >= 4) {
         a->plan = notorious_fft_create_plan(N / 2, 0);
@@ -1489,6 +1531,10 @@ notorious_fft_aux* notorious_fft_mkaux_realdft_1d(int N) {
     }
 
     return a;
+
+fail:
+    notorious_fft_free_aux(a);
+    return NULL;
 }
 
 notorious_fft_aux* notorious_fft_mkaux_realdft(int d, int* Ns) {
@@ -1510,6 +1556,14 @@ notorious_fft_aux* notorious_fft_mkaux_realdft(int d, int* Ns) {
         memset(a, 0, sizeof(*a));
 
         a->N = Ns[d-1] * p;
+        size_t packed_count, packed_bytes;
+        if (!notorious_fft_size_mul((size_t)p, (size_t)Ns[d-1]/2+1, &packed_count) ||
+            !notorious_fft_size_mul(packed_count, sizeof(notorious_fft_cmpl), &packed_bytes)) {
+            notorious_fft_free_aux(a);
+            return NULL;
+        }
+        a->t = notorious_fft_malloc(packed_bytes);
+        if (!a->t) { notorious_fft_free_aux(a); return NULL; }
         a->sub1 = notorious_fft_mkaux_realdft_1d(Ns[d-1]);
         a->sub2 = notorious_fft_mkaux_dft(d - 1, Ns);
 
