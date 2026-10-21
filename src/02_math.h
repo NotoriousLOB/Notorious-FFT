@@ -73,7 +73,15 @@ static NOTORIOUS_FFT_INLINE notorious_fft_real notorious_fft_cos_accurate(notori
  * Memory Management
  * ============================================================================ */
 
+/* All allocated objects must also fit pointer-difference arithmetic. */
+static NOTORIOUS_FFT_INLINE int notorious_fft_size_mul(size_t a, size_t b, size_t *out) {
+    if (b && a > (size_t)PTRDIFF_MAX / b) return 0;
+    *out = a * b;
+    return 1;
+}
+
 static NOTORIOUS_FFT_INLINE void* notorious_fft_malloc(size_t size) {
+    if (size > (size_t)PTRDIFF_MAX) return NULL;
     void* ptr = NULL;
 #if defined(_MSC_VER)
     ptr = _aligned_malloc(size, 64);
@@ -223,6 +231,17 @@ static NOTORIOUS_FFT_INLINE size_t notorious_fft_primitive_root(size_t n) {
 /* Round n up to the next multiple of NOTORIOUS_FFT_BUMP_ALIGN */
 #define NOTORIOUS_FFT_BUMP_ROUND(n) \
     (((size_t)(n) + NOTORIOUS_FFT_BUMP_ALIGN - 1u) & ~(size_t)(NOTORIOUS_FFT_BUMP_ALIGN - 1u))
+
+/* Add one aligned field (count elements) to a slab without wrapping. */
+static NOTORIOUS_FFT_INLINE int notorious_fft_slab_add(size_t *total, size_t count, size_t elem) {
+    size_t bytes;
+    if (!notorious_fft_size_mul(count, elem, &bytes) ||
+        bytes > (size_t)PTRDIFF_MAX - (NOTORIOUS_FFT_BUMP_ALIGN - 1u)) return 0;
+    bytes = NOTORIOUS_FFT_BUMP_ROUND(bytes);
+    if (*total > (size_t)PTRDIFF_MAX - bytes) return 0;
+    *total += bytes;
+    return 1;
+}
 
 /* Suballocate from the high end of the slab, decrementing the bump pointer.
  * 'bump' is a (char**) pointing to the current high-water mark. */

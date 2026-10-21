@@ -7,6 +7,18 @@
 
 #include "02_math.h"
 
+#if NOTORIOUS_FFT_HAS_NEON
+/* Standard C/C++ initializers, including inside conditional expressions. */
+static NOTORIOUS_FFT_INLINE float64x2_t notorious_fft_neon_pair_f64(double a, double b) {
+    float64x2_t v = {a, b};
+    return v;
+}
+static NOTORIOUS_FFT_INLINE float32x4_t notorious_fft_neon_quad_f32(float a, float b, float c, float d) {
+    float32x4_t v = {a, b, c, d};
+    return v;
+}
+#endif
+
 /* ============================================================================
  * AVX-512 Implementation
  * ============================================================================ */
@@ -175,8 +187,8 @@ static NOTORIOUS_FFT_INLINE void notorious_fft_butterfly4_neon_f32(
     float32x4_t vr = vld1q_f32(&wr[i2]);
     float32x4_t vi = vld1q_f32(&wi[i2]);
     
-    float32x4_t t_wr = (float32x4_t){wr0, wr1, wr2, wr3};
-    float32x4_t t_wi = (float32x4_t){wi0, wi1, wi2, wi3};
+    float32x4_t t_wr = notorious_fft_neon_quad_f32(wr0, wr1, wr2, wr3);
+    float32x4_t t_wi = notorious_fft_neon_quad_f32(wi0, wi1, wi2, wi3);
     
     float32x4_t vro = vsubq_f32(vmulq_f32(vr, t_wr), vmulq_f32(vi, t_wi));
     float32x4_t vio = vaddq_f32(vmulq_f32(vr, t_wi), vmulq_f32(vi, t_wr));
@@ -198,8 +210,8 @@ static NOTORIOUS_FFT_INLINE void notorious_fft_butterfly2_neon_f64(
     float64x2_t vr = vld1q_f64(&wr[i2]);
     float64x2_t vi = vld1q_f64(&wi[i2]);
     
-    float64x2_t t_wr = (float64x2_t){wr0, wr1};
-    float64x2_t t_wi = (float64x2_t){wi0, wi1};
+    float64x2_t t_wr = notorious_fft_neon_pair_f64(wr0, wr1);
+    float64x2_t t_wi = notorious_fft_neon_pair_f64(wi0, wi1);
     
     float64x2_t vro = vsubq_f64(vmulq_f64(vr, t_wr), vmulq_f64(vi, t_wi));
     float64x2_t vio = vaddq_f64(vmulq_f64(vr, t_wi), vmulq_f64(vi, t_wr));
@@ -284,7 +296,7 @@ static void notorious_fft_bluestein_convolve_neon(size_t M,
 
 /* Vectorized complex multiply with scaling for post-multiply (Step 5)
  * out = buf * chirp * scale */
-static void notorious_fft_bluestein_postmul_neon(size_t N,
+static NOTORIOUS_FFT_INLINE void notorious_fft_bluestein_postmul_neon(size_t N,
                                            notorious_fft_real *NOTORIOUS_FFT_RESTRICT out_re,
                                            notorious_fft_real *NOTORIOUS_FFT_RESTRICT out_im,
                                            const notorious_fft_real *NOTORIOUS_FFT_RESTRICT buf_re,
@@ -407,7 +419,7 @@ static void notorious_fft_bluestein_convolve_avx2(size_t M,
 }
 
 /* Vectorized complex multiply with scaling for post-multiply (Step 5) */
-static void notorious_fft_bluestein_postmul_avx2(size_t N,
+static NOTORIOUS_FFT_INLINE void notorious_fft_bluestein_postmul_avx2(size_t N,
                                            notorious_fft_real *NOTORIOUS_FFT_RESTRICT out_re,
                                            notorious_fft_real *NOTORIOUS_FFT_RESTRICT out_im,
                                            const notorious_fft_real *NOTORIOUS_FFT_RESTRICT buf_re,

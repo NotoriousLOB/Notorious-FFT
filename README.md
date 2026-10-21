@@ -8,17 +8,24 @@
 
 A header-only Fast Fourier Transform library for C/C++.
 
-Notorious FFT provides a complete set of discrete transforms in a single header file with no dependencies beyond the C standard library.
+Notorious FFT provides complex Fourier and cosine/sine transforms in a single header file with no dependencies beyond the C standard library.
 
 ## Features
 
 - **Header-only**: single file `include/notorious_fft.h`, just `#include` and go
 - **FFTW-shaped planner**: `plan_dft_*` / `execute` / `destroy_io_plan`, plus `include/notorious_fft_fftw.h` aliases
-- **All transform types**: complex DFT, real DFT (including 2D/3D r2c), DCT-2/3/4, DST-2/3/4
-- **Any size**: split-radix for powers of two, mixed-radix 3/5/7, Rader for primes with smooth N−1, Bluestein otherwise
+- **Native 1D/2D/3D r2r plans**: arbitrary positive-length DCT-II/III, row-major tensors, mixed DCT/DST axes, and reusable workspace; see the [r2r contract and validation gate](docs/r2r.md)
+- **Transform families**: complex DFT, real DFT (including 2D/3D r2c), DCT-2/3/4, DST-2/3/4
+- **Any complex DFT size**: split-radix for powers of two, mixed-radix 3/5/7, Rader for primes with smooth N−1, Bluestein otherwise
 - **SIMD**: NEON, AVX2, AVX-512 selected at compile time (not stubs)
 - **Single and double precision**: define `NOTORIOUS_FFT_SINGLE` for float, default is double
-- **Version**: 1.0.0 (`NOTORIOUS_FFT_VERSION_*`)
+- **Version**: 1.1.0 (`NOTORIOUS_FFT_VERSION_*`)
+
+v1.1.0 adds arbitrary-length DCT-II/III and native row-major 2D/3D r2r
+plans with independent kinds per axis. It hardens planning failure cleanup,
+fixes small in-place and unit-axis transforms, and adds independent formula,
+FFTW, allocation-failure, sanitizer, and strict consumer validation. The
+arbitrary-length fallback is quadratic; see [the supported subset](docs/r2r.md).
 
 ### Accuracy Modes
 
@@ -118,7 +125,9 @@ Auxiliary data contains precomputed twiddle factors and temporary buffers. It is
 
 ### Data Layout
 
-Transform definitions and data layout are compatible with FFTW:
+The tested real-to-real compatibility subset, formulas, normalization, length
+restrictions, and aliasing rules are documented in [docs/r2r.md](docs/r2r.md).
+Other existing data-layout conventions include:
 - Complex data is stored as interleaved real/imaginary pairs (`double[2]`)
 - Real DFT output has `N/2+1` complex elements
 - Multi-dimensional inverse real DFT does not preserve its input
@@ -262,7 +271,7 @@ This produces three plots:
 
 ## Algorithm
 
-Notorious FFT uses split-radix (2/4) decimation-in-frequency by default (no bit-reversal; unrolled terminals for N≤32). `NOTORIOUS_FFT_MEASURE` may select a DIT combine or iterative Cooley–Tukey instead. Real transforms reduce to half-length complex FFTs. Mixed-radix 3/5/7 peels those factors even when the cofactor is prime. Prime lengths whose N−1 is 2·3·5·7-smooth use Rader (an (N−1)-point FFT), including small Mersenne primes 31 and 127 and Fermat primes 17 and 257. Padding a Mersenne length 2^p−1 with one zero and taking a 2^p FFT is a different transform (bin frequencies 2πk/2^p, not 2πk/n) and is not used. Awkward sizes fall back to Bluestein. DCT-2/3 go through real DFT with pre/post twiddles; DCT-4/DST-4 reduce to an N/2-point complex DFT. All per-plan memory is a single 64-byte-aligned slab.
+Notorious FFT uses split-radix (2/4) decimation-in-frequency by default (no bit-reversal; unrolled terminals for N≤32). `NOTORIOUS_FFT_MEASURE` may select a DIT combine or iterative Cooley–Tukey instead. Real transforms reduce to half-length complex FFTs. Mixed-radix 3/5/7 peels those factors even when the cofactor is prime. Prime lengths whose N−1 is 2·3·5·7-smooth use Rader (an (N−1)-point FFT), including small Mersenne primes 31 and 127 and Fermat primes 17 and 257. Padding a Mersenne length 2^p−1 with one zero and taking a 2^p FFT is a different transform (bin frequencies 2πk/2^p, not 2πk/n) and is not used. Awkward complex FFT sizes fall back to Bluestein. Power-of-two DCT-2/3 use real DFT pre/post twiddles; other positive lengths use a quadratic direct fallback. DCT-4/DST-4 retain their power-of-two restriction and reduce to an N/2-point complex DFT. Each FFT engine plan owns a 64-byte-aligned slab; r2r plans own additional axis auxiliaries and preallocated line buffers.
 
 ## License
 

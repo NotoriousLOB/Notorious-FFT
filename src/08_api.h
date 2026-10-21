@@ -54,6 +54,10 @@ typedef struct notorious_fft_io_plan {
     int howmany;
     int istride, ostride;
     int idist, odist;
+    /* r2r only: independent 1D auxiliaries and reusable gather/scatter lines. */
+    notorious_fft_aux *axis_aux[3];
+    notorious_fft_real *axis_in, *axis_out;
+    size_t r2r_count;
 } notorious_fft_io_plan;
 
 notorious_fft_io_plan *notorious_fft_plan_dft_1d(int n, notorious_fft_cmpl *in, notorious_fft_cmpl *out,
@@ -74,8 +78,23 @@ notorious_fft_io_plan *notorious_fft_plan_dft_r2c_2d(int n0, int n1, notorious_f
 notorious_fft_io_plan *notorious_fft_plan_dft_c2r_2d(int n0, int n1, notorious_fft_cmpl *in, notorious_fft_real *out,
                                                      unsigned flags);
 
+/* Unnormalized separable real-to-real transforms, row-major (last axis
+ * contiguous). REDFT10/01 accept all positive int lengths; REDFT11 and
+ * RODFT10/01/11 require powers of two (type IV also N <= INT_MAX/2).
+ * Other kinds are rejected. Inverse composition scale is the product of 2N
+ * over axes. Flags are estimate-like; planning never touches user arrays.
+ * NULL means invalid/unsupported dimensions or kinds, overflow, or OOM.
+ * Arrays may be identical or disjoint, and may be replaced at execution;
+ * partial overlap is unsupported. All scratch is allocated while planning.
+ * Distinct plans may execute concurrently; shared plans need synchronization.
+ * See docs/r2r.md for formulas and the tested FFTW compatibility subset. */
 notorious_fft_io_plan *notorious_fft_plan_r2r_1d(int n, notorious_fft_real *in, notorious_fft_real *out,
                                                  notorious_fft_r2r_kind kind, unsigned flags);
+notorious_fft_io_plan *notorious_fft_plan_r2r_2d(int n0, int n1, notorious_fft_real *in, notorious_fft_real *out,
+                                                 notorious_fft_r2r_kind k0, notorious_fft_r2r_kind k1, unsigned flags);
+notorious_fft_io_plan *notorious_fft_plan_r2r_3d(int n0, int n1, int n2, notorious_fft_real *in, notorious_fft_real *out,
+                                                 notorious_fft_r2r_kind k0, notorious_fft_r2r_kind k1,
+                                                 notorious_fft_r2r_kind k2, unsigned flags);
 
 notorious_fft_io_plan *notorious_fft_plan_many_dft(int rank, const int *n, int howmany,
                                                    notorious_fft_cmpl *in, const int *inembed,
@@ -243,22 +262,69 @@ static notorious_fft_aux *notorious_fft_aux_for_r2r(int n, notorious_fft_r2r_kin
     }
 }
 
-notorious_fft_io_plan *notorious_fft_plan_r2r_1d(int n, notorious_fft_real *in, notorious_fft_real *out,
-                                                 notorious_fft_r2r_kind kind, unsigned flags) {
-    if (n <= 0) return NULL;
-    notorious_fft_aux *aux = notorious_fft_aux_for_r2r(n, kind);
-    if (!aux) return NULL;
+static int notorious_fft_r2r_supported(int n, notorious_fft_r2r_kind kind) {
+    if (n <= 0) return 0;
+    switch (kind) {
+    case NOTORIOUS_FFT_REDFT10:
+    case NOTORIOUS_FFT_REDFT01: return 1;
+    case NOTORIOUS_FFT_RODFT10:
+    case NOTORIOUS_FFT_RODFT01: return !(n & (n - 1));
+    case NOTORIOUS_FFT_REDFT11:
+    case NOTORIOUS_FFT_RODFT11: return n <= INT_MAX / 2 && !(n & (n - 1));
+    default: return 0;
+    }
+}
+
+static notorious_fft_io_plan *notorious_fft_plan_r2r_axes(int rank, const int *n,
+        notorious_fft_real *in, notorious_fft_real *out,
+        const notorious_fft_r2r_kind *kinds, unsigned flags) {
+    size_t count = 1, max_n = 0, bytes;
+    /* Validate every axis and the entire array before allocating anything. */
+    for (int i = 0; i < rank; ++i) {
+        if (!notorious_fft_r2r_supported(n[i], kinds[i]) ||
+            !notorious_fft_size_mul(count, (size_t)n[i], &count)) return NULL;
+        if ((size_t)n[i] > max_n) max_n = (size_t)n[i];
+    }
+    if (!notorious_fft_size_mul(count, sizeof(notorious_fft_real), &bytes) ||
+        !notorious_fft_size_mul(max_n, sizeof(notorious_fft_real), &bytes)) return NULL;
     notorious_fft_io_plan *p = notorious_fft_io_plan_new();
-    if (!p) { notorious_fft_free_aux(aux); return NULL; }
-    p->rank = 1;
-    p->n[0] = n;
+    if (!p) return NULL;
+    p->rank = rank;
+    p->r2r_count = count;
     p->kind = NOTORIOUS_FFT_IO_R2R;
-    p->r2r_kind[0] = kind;
     p->flags = flags;
     p->in = in;
     p->out = out;
-    p->aux = aux;
+    for (int i = 0; i < rank; ++i) {
+        p->n[i] = n[i];
+        p->r2r_kind[i] = kinds[i];
+        p->axis_aux[i] = notorious_fft_aux_for_r2r(n[i], kinds[i]);
+        if (!p->axis_aux[i]) { notorious_fft_destroy_io_plan(p); return NULL; }
+    }
+    p->axis_in = (notorious_fft_real*)notorious_fft_malloc(bytes);
+    if (rank > 1) p->axis_out = (notorious_fft_real*)notorious_fft_malloc(bytes);
+    if (!p->axis_in || (rank > 1 && !p->axis_out)) { notorious_fft_destroy_io_plan(p); return NULL; }
     return p;
+}
+
+notorious_fft_io_plan *notorious_fft_plan_r2r_1d(int n, notorious_fft_real *in, notorious_fft_real *out,
+                                                 notorious_fft_r2r_kind kind, unsigned flags) {
+    return notorious_fft_plan_r2r_axes(1, &n, in, out, &kind, flags);
+}
+
+notorious_fft_io_plan *notorious_fft_plan_r2r_2d(int n0, int n1, notorious_fft_real *in, notorious_fft_real *out,
+                                                 notorious_fft_r2r_kind k0, notorious_fft_r2r_kind k1, unsigned flags) {
+    const int ns[2] = {n0, n1};
+    const notorious_fft_r2r_kind ks[2] = {k0, k1};
+    return notorious_fft_plan_r2r_axes(2, ns, in, out, ks, flags);
+}
+
+notorious_fft_io_plan *notorious_fft_plan_r2r_3d(int n0, int n1, int n2, notorious_fft_real *in, notorious_fft_real *out,
+                                                 notorious_fft_r2r_kind k0, notorious_fft_r2r_kind k1,
+                                                 notorious_fft_r2r_kind k2, unsigned flags) {
+    const int ns[3] = {n0, n1, n2};
+    const notorious_fft_r2r_kind ks[3] = {k0, k1, k2};
+    return notorious_fft_plan_r2r_axes(3, ns, in, out, ks, flags);
 }
 
 notorious_fft_io_plan *notorious_fft_plan_many_dft(int rank, const int *n, int howmany,
@@ -350,16 +416,47 @@ void notorious_fft_execute_dft_c2r(const notorious_fft_io_plan *p, notorious_fft
     notorious_fft_invrealdft(in, out, p->aux);
 }
 
-void notorious_fft_execute_r2r(const notorious_fft_io_plan *p, notorious_fft_real *in, notorious_fft_real *out) {
-    if (!p || !p->aux || !in || !out) return;
-    switch (p->r2r_kind[0]) {
-    case NOTORIOUS_FFT_REDFT10: notorious_fft_dct2(in, out, p->aux); break;
-    case NOTORIOUS_FFT_REDFT01: notorious_fft_dct3(in, out, p->aux); break;
-    case NOTORIOUS_FFT_REDFT11: notorious_fft_dct4(in, out, p->aux); break;
-    case NOTORIOUS_FFT_RODFT10: notorious_fft_dst2(in, out, p->aux); break;
-    case NOTORIOUS_FFT_RODFT01: notorious_fft_dst3(in, out, p->aux); break;
-    case NOTORIOUS_FFT_RODFT11: notorious_fft_dst4(in, out, p->aux); break;
+static void notorious_fft_execute_axis(notorious_fft_r2r_kind kind, notorious_fft_aux *aux,
+                                       notorious_fft_real *in, notorious_fft_real *out) {
+    switch (kind) {
+    case NOTORIOUS_FFT_REDFT10: notorious_fft_dct2(in, out, aux); break;
+    case NOTORIOUS_FFT_REDFT01: notorious_fft_dct3(in, out, aux); break;
+    case NOTORIOUS_FFT_REDFT11: notorious_fft_dct4(in, out, aux); break;
+    case NOTORIOUS_FFT_RODFT10: notorious_fft_dst2(in, out, aux); break;
+    case NOTORIOUS_FFT_RODFT01: notorious_fft_dst3(in, out, aux); break;
+    case NOTORIOUS_FFT_RODFT11: notorious_fft_dst4(in, out, aux); break;
     default: break;
+    }
+}
+
+void notorious_fft_execute_r2r(const notorious_fft_io_plan *p, notorious_fft_real *in, notorious_fft_real *out) {
+    if (!p || p->kind != NOTORIOUS_FFT_IO_R2R || !in || !out) return;
+    int last = p->rank - 1;
+    size_t stride = (size_t)p->n[last];
+    /* Transform contiguous rows directly into output. Only exact aliasing
+     * needs an input copy; kernels always receive disjoint input and output. */
+    for (size_t base = 0; base < p->r2r_count; base += stride) {
+        notorious_fft_real *src = in + base;
+        if (in == out) {
+            memcpy(p->axis_in, src, stride * sizeof(*src));
+            src = p->axis_in;
+        }
+        notorious_fft_execute_axis(p->r2r_kind[last], p->axis_aux[last], src, out + base);
+    }
+    /* Gather complete strided lines before scattering into the same tensor. */
+    for (int axis = last - 1; axis >= 0; --axis) {
+        size_t len = (size_t)p->n[axis];
+        size_t block = len * stride;
+        for (size_t base = 0; base < p->r2r_count; base += block) {
+            for (size_t offset = 0; offset < stride; ++offset) {
+                for (size_t j = 0; j < len; ++j)
+                    p->axis_in[j] = out[base + offset + j * stride];
+                notorious_fft_execute_axis(p->r2r_kind[axis], p->axis_aux[axis], p->axis_in, p->axis_out);
+                for (size_t j = 0; j < len; ++j)
+                    out[base + offset + j * stride] = p->axis_out[j];
+            }
+        }
+        stride = block;
     }
 }
 
@@ -384,6 +481,9 @@ void notorious_fft_execute(const notorious_fft_io_plan *p) {
 void notorious_fft_destroy_io_plan(notorious_fft_io_plan *p) {
     if (!p) return;
     notorious_fft_free_aux(p->aux);
+    for (int i = 0; i < 3; ++i) notorious_fft_free_aux(p->axis_aux[i]);
+    notorious_fft_free(p->axis_in);
+    notorious_fft_free(p->axis_out);
     free(p);
 }
 

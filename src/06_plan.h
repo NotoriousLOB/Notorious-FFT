@@ -29,7 +29,7 @@ static void notorious_fft_destroy_plan(notorious_fft_plan* plan);
  * ============================================================================ */
 
 static notorious_fft_plan* notorious_fft_create_plan_bluestein(size_t n, int inverse) {
-    if (n == 0) return NULL;
+    if (n == 0 || n > INT_MAX / 2) return NULL;
     /* 2n-1 must fit in size_t; convolution pad is the next power of two. */
     if (n > (SIZE_MAX - 1) / 2) return NULL;
 
@@ -51,11 +51,12 @@ static notorious_fft_plan* notorious_fft_create_plan_bluestein(size_t n, int inv
      *   work_re             [m reals]
      *   work_im             [m reals]   ← slab end (high address, bump starts here)
      */
-    size_t real_bytes = m * sizeof(notorious_fft_real);
-    size_t total = NOTORIOUS_FFT_SLAB_FIELD(sizeof(notorious_fft_plan))
-                 + NOTORIOUS_FFT_SLAB_FIELD(real_bytes) * 10;  /* 10 arrays of m reals */
-    /* Round total to alignment - ensures bump starts at aligned address */
-    total = NOTORIOUS_FFT_BUMP_ROUND(total);
+    if (m > INT_MAX / 2) return NULL; /* interleaved kernel indices use int */
+    size_t real_bytes;
+    size_t total = NOTORIOUS_FFT_SLAB_FIELD(sizeof(notorious_fft_plan));
+    if (!notorious_fft_size_mul(m, sizeof(notorious_fft_real), &real_bytes)) return NULL;
+    for (int i = 0; i < 10; ++i)
+        if (!notorious_fft_slab_add(&total, m, sizeof(notorious_fft_real))) return NULL;
 
     void* slab = notorious_fft_malloc(total);
     if (!slab) return NULL;
@@ -129,12 +130,13 @@ cleanup:
  * ============================================================================ */
 
 static notorious_fft_plan* notorious_fft_create_plan_power2(size_t n) {
-    if (n == 0 || (n & (n - 1))) return NULL;
+    if (n == 0 || n > INT_MAX / 2 || (n & (n - 1))) return NULL;
 
     size_t real_bytes  = sizeof(notorious_fft_real);
     size_t int_bytes   = sizeof(int);
 
-    size_t total;
+    size_t total = NOTORIOUS_FFT_SLAB_FIELD(sizeof(notorious_fft_plan));
+    if (!notorious_fft_slab_add(&total, n, int_bytes)) return NULL;
 
     if (n <= NOTORIOUS_FFT_SMALL_SIZE) {
         /* Small plan slab layout (high→low):
@@ -145,10 +147,9 @@ static notorious_fft_plan* notorious_fft_create_plan_power2(size_t n) {
          *   tw_re      [n/2+1 reals]
          *   bitrev     [n ints]
          */
-        total = NOTORIOUS_FFT_SLAB_FIELD(sizeof(notorious_fft_plan))
-              + NOTORIOUS_FFT_SLAB_FIELD(n * int_bytes)
-              + NOTORIOUS_FFT_SLAB_FIELD((n / 2 + 1) * real_bytes) * 2
-              + NOTORIOUS_FFT_SLAB_FIELD(n * real_bytes) * 2;
+        for (int i = 0; i < 2; ++i)
+            if (!notorious_fft_slab_add(&total, n / 2 + 1, real_bytes) ||
+                !notorious_fft_slab_add(&total, n, real_bytes)) return NULL;
     } else {
         /* Round total to alignment - ensures bump starts at aligned address */
         /* Large plan slab layout (high→low):
@@ -160,14 +161,14 @@ static notorious_fft_plan* notorious_fft_create_plan_power2(size_t n) {
          *   tw_re      [n/2 reals]
          *   bitrev     [n ints]
          */
-        total = NOTORIOUS_FFT_SLAB_FIELD(sizeof(notorious_fft_plan))
-              + NOTORIOUS_FFT_SLAB_FIELD(n * int_bytes)
-              + NOTORIOUS_FFT_SLAB_FIELD((n / 2) * real_bytes) * 2
-              + NOTORIOUS_FFT_SLAB_FIELD(2 * n * real_bytes)     /* work_re (2n, work_im aliased) */
-              + NOTORIOUS_FFT_SLAB_FIELD(2 * n * real_bytes) * 2;/* sr_e, sr_t */
-        if (n >= (size_t)NOTORIOUS_FFT_FOURSTEP_MIN)
-            total += NOTORIOUS_FFT_SLAB_FIELD(n * real_bytes) * 2; /* four-step twiddles */
-        total = NOTORIOUS_FFT_BUMP_ROUND(total);
+        for (int i = 0; i < 2; ++i)
+            if (!notorious_fft_slab_add(&total, n / 2, real_bytes)) return NULL;
+        for (int i = 0; i < 3; ++i)
+            if (!notorious_fft_slab_add(&total, n, 2 * real_bytes)) return NULL;
+        if (n >= (size_t)NOTORIOUS_FFT_FOURSTEP_MIN) {
+            for (int i = 0; i < 2; ++i)
+                if (!notorious_fft_slab_add(&total, n, real_bytes)) return NULL;
+        }
     }
 
     void* slab = notorious_fft_malloc(total);
@@ -270,19 +271,20 @@ static notorious_fft_plan* notorious_fft_create_plan_power2(size_t n) {
  * ============================================================================ */
 
 static notorious_fft_plan* notorious_fft_create_plan_mixed(size_t n) {
+    if (n == 0 || n > INT_MAX / 2) return NULL;
     int radix = (n % 7u == 0) ? 7 : (n % 5u == 0) ? 5 : 3;
     if (n % (size_t)radix != 0) return NULL;
     size_t m = n / (size_t)radix;
 
-    notorious_fft_plan* sub = notorious_fft_create_plan(m, 0);
-    if (!sub) return NULL;
-
     size_t tw_count = (size_t)(radix - 1) * m;
     size_t real_bytes = sizeof(notorious_fft_real);
-    size_t total = NOTORIOUS_FFT_SLAB_FIELD(sizeof(notorious_fft_plan))
-                 + NOTORIOUS_FFT_SLAB_FIELD(2 * n * real_bytes)          /* sr_t work */
-                 + NOTORIOUS_FFT_SLAB_FIELD(tw_count * real_bytes) * 2;  /* tw_re, tw_im */
-    total = NOTORIOUS_FFT_BUMP_ROUND(total);
+    size_t total = NOTORIOUS_FFT_SLAB_FIELD(sizeof(notorious_fft_plan));
+    if (!notorious_fft_slab_add(&total, n, 2 * real_bytes) ||
+        !notorious_fft_slab_add(&total, tw_count, real_bytes) ||
+        !notorious_fft_slab_add(&total, tw_count, real_bytes)) return NULL;
+
+    notorious_fft_plan* sub = notorious_fft_create_plan(m, 0);
+    if (!sub) return NULL;
 
     void* slab = notorious_fft_malloc(total);
     if (!slab) {
@@ -318,7 +320,7 @@ static notorious_fft_plan* notorious_fft_create_plan_rader(size_t n) {
     /* Prime N, (N−1) 2·3·5·7-smooth → (N−1)-point FFT instead of Bluestein ~2N.
      * Mersenne N=2^p−1 is (n&(n+1))==0; do NOT pad a zero onto the 2^p path —
      * that is a different DFT. Small Mersenne primes (3,7,31,127) have smooth N−1. */
-    if (n < 11 || n > (size_t)0x7fffffff) return NULL;
+    if (n < 11 || n > INT_MAX / 2) return NULL;
     /* Mersenne N=2^p−1 is (n&(n+1))==0; still need primality (15, 63, 255
      * are composite) and a smooth N−1. Do not pad onto the 2^p path. */
     (void)notorious_fft_is_mersenne_number(n);
@@ -330,16 +332,16 @@ static notorious_fft_plan* notorious_fft_create_plan_rader(size_t n) {
     if (ginv == 0) return NULL;
     size_t m = n - 1;
 
-    notorious_fft_plan* sub = notorious_fft_create_plan(m, 0);
-    if (!sub) return NULL;
-
     size_t real_bytes = sizeof(notorious_fft_real);
     size_t int_bytes = sizeof(int);
-    size_t total = NOTORIOUS_FFT_SLAB_FIELD(sizeof(notorious_fft_plan))
-                 + NOTORIOUS_FFT_SLAB_FIELD(m * int_bytes) * 2
-                 + NOTORIOUS_FFT_SLAB_FIELD(m * real_bytes) * 2
-                 + NOTORIOUS_FFT_SLAB_FIELD(2 * n * real_bytes);
-    total = NOTORIOUS_FFT_BUMP_ROUND(total);
+    size_t total = NOTORIOUS_FFT_SLAB_FIELD(sizeof(notorious_fft_plan));
+    for (int i = 0; i < 2; ++i)
+        if (!notorious_fft_slab_add(&total, m, int_bytes) ||
+            !notorious_fft_slab_add(&total, m, real_bytes)) return NULL;
+    if (!notorious_fft_slab_add(&total, n, 2 * real_bytes)) return NULL;
+
+    notorious_fft_plan* sub = notorious_fft_create_plan(m, 0);
+    if (!sub) return NULL;
 
     void* slab = notorious_fft_malloc(total);
     if (!slab) {
@@ -383,22 +385,20 @@ static notorious_fft_plan* notorious_fft_create_plan_rader(size_t n) {
 }
 
 static notorious_fft_plan* notorious_fft_create_plan(size_t n, int inverse) {
-    if (n == 0) return NULL;
+    if (n == 0 || n > INT_MAX / 2) return NULL;
     if ((n & (n - 1)) == 0)
         return notorious_fft_create_plan_power2(n);
     /* Peel 3/5/7 even when the cofactor is prime (Rader) or awkward (Bluestein). */
     if (n % 7u == 0 || n % 5u == 0 || n % 3u == 0) {
-        notorious_fft_plan* p = notorious_fft_create_plan_mixed(n);
-        if (p) return p;
+        return notorious_fft_create_plan_mixed(n);
     }
     if (n >= 11 && notorious_fft_is_prime(n) && notorious_fft_is_2357_smooth(n - 1)) {
-        notorious_fft_plan* p = notorious_fft_create_plan_rader(n);
-        if (p) return p;
+        return notorious_fft_create_plan_rader(n);
     }
     return notorious_fft_create_plan_bluestein(n, inverse);
 }
 
-static void notorious_fft_tune_plan(notorious_fft_plan* plan) {
+static inline void notorious_fft_tune_plan(notorious_fft_plan* plan) {
     if (!plan || !plan->sr_e || !plan->sr_t || !plan->bitrev || plan->n < 32)
         return;
     size_t n = plan->n;

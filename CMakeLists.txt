@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.14)
-project(notoriousfft VERSION 1.0.0 LANGUAGES C CXX)
+project(notoriousfft VERSION 1.1.0 LANGUAGES C CXX)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
@@ -18,6 +18,10 @@ option(NOTORIOUS_FFT_BUILD_TESTS       "Build tests"       ON)
 option(NOTORIOUS_FFT_BUILD_BENCHMARKS  "Build benchmarks"  ON)
 option(NOTORIOUS_FFT_BUILD_EXAMPLES    "Build examples"    ON)
 option(NOTORIOUS_FFT_BUILD_COMPREHENSIVE_BENCHMARK "Build comprehensive benchmark (FFTW3, KissFFT, PocketFFT, muFFT)" OFF)
+option(NOTORIOUS_FFT_VALIDATE_FFTW "Require FFTW3 and run the r2r differential validation gate" OFF)
+if(NOTORIOUS_FFT_VALIDATE_FFTW AND NOT NOTORIOUS_FFT_BUILD_TESTS)
+    message(FATAL_ERROR "NOTORIOUS_FFT_VALIDATE_FFTW requires NOTORIOUS_FFT_BUILD_TESTS")
+endif()
 
 # ---- Global optimization flags ----
 # Do not pass -ffast-math by default: it rewrites libm sin/cos and breaks
@@ -112,21 +116,23 @@ add_custom_target(notoriousfft_amalgam ALL DEPENDS ${NOTORIOUS_FFT_AMALGAM_OUT})
 
 # ---- Fetch minfft (reference implementation, used for tests/benchmarks) ----
 include(FetchContent)
-FetchContent_Declare(
-    minfft
-    GIT_REPOSITORY https://github.com/aimukhin/minfft.git
-    GIT_TAG        master
-)
-FetchContent_MakeAvailable(minfft)
+if(NOTORIOUS_FFT_BUILD_TESTS OR NOTORIOUS_FFT_BUILD_BENCHMARKS OR NOTORIOUS_FFT_BUILD_COMPREHENSIVE_BENCHMARK)
+    FetchContent_Declare(
+        minfft
+        GIT_REPOSITORY https://github.com/aimukhin/minfft.git
+        GIT_TAG        master
+    )
+    FetchContent_MakeAvailable(minfft)
 
-# minfft doesn't have a CMakeLists, build it as a library ourselves
-add_library(minfft STATIC ${minfft_SOURCE_DIR}/minfft.c)
-target_include_directories(minfft PUBLIC ${minfft_SOURCE_DIR})
-target_compile_options(minfft PRIVATE
-    $<$<CONFIG:Release>:-O3>
-    $<$<CONFIG:RelWithDebInfo>:-O3>
-    ${NOTORIOUS_FFT_ARCH_FLAGS}
-)
+    # minfft doesn't have a CMakeLists, build it as a library ourselves
+    add_library(minfft STATIC ${minfft_SOURCE_DIR}/minfft.c)
+    target_include_directories(minfft PUBLIC ${minfft_SOURCE_DIR})
+    target_compile_options(minfft PRIVATE
+        $<$<CONFIG:Release>:-O3>
+        $<$<CONFIG:RelWithDebInfo>:-O3>
+        ${NOTORIOUS_FFT_ARCH_FLAGS}
+    )
+endif()
 
 # ---- Header-only interface library ----
 add_library(notoriousfft INTERFACE)
@@ -185,6 +191,64 @@ if(NOTORIOUS_FFT_BUILD_TESTS)
     target_link_libraries(test_notoriousfft_cpp PRIVATE minfft)
     target_include_directories(test_notoriousfft_cpp PRIVATE ${minfft_SOURCE_DIR})
     add_test(NAME test_notoriousfft_cpp COMMAND test_notoriousfft_cpp)
+
+    # Core correctness gate uses double precision and accurate twiddles.
+    if(NOT NOTORIOUS_FFT_SINGLE AND NOT NOTORIOUS_FFT_FAST_MATH)
+        notoriousfft_add_executable(repro_r2r tests/repro_r2r.c)
+        add_test(NAME repro_r2r COMMAND repro_r2r)
+        notoriousfft_add_executable(test_r2r tests/test_r2r.c)
+        add_test(NAME test_r2r COMMAND test_r2r)
+        notoriousfft_add_executable(test_r2r_memory tests/test_r2r_memory.c)
+        # Reach nested four-step planning without a million-point fixture.
+        target_compile_definitions(test_r2r_memory PRIVATE NOTORIOUS_FFT_FOURSTEP_MIN=64)
+        add_test(NAME test_r2r_memory COMMAND test_r2r_memory)
+
+        foreach(std 99 11)
+            notoriousfft_add_executable(consumer_r2r_c${std} tests/consumer_r2r.c)
+            set_target_properties(consumer_r2r_c${std} PROPERTIES C_STANDARD ${std} C_STANDARD_REQUIRED ON C_EXTENSIONS OFF)
+            target_compile_definitions(consumer_r2r_c${std} PRIVATE NOTORIOUS_TEST_EXPECTED_VERSION="${PROJECT_VERSION}")
+            if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+                target_compile_options(consumer_r2r_c${std} PRIVATE -Wall -Wextra -Wpedantic -Werror)
+            endif()
+            add_test(NAME consumer_r2r_c${std} COMMAND consumer_r2r_c${std})
+        endforeach()
+        notoriousfft_add_executable_cpp(consumer_r2r_cpp tests/consumer_r2r.cpp)
+        set_target_properties(consumer_r2r_cpp PROPERTIES CXX_EXTENSIONS OFF)
+        target_compile_definitions(consumer_r2r_cpp PRIVATE NOTORIOUS_TEST_EXPECTED_VERSION="${PROJECT_VERSION}")
+        if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+            target_compile_options(consumer_r2r_cpp PRIVATE -Wall -Wextra -Wpedantic -Werror)
+        endif()
+        add_test(NAME consumer_r2r_cpp COMMAND consumer_r2r_cpp)
+
+        add_executable(consumer_r2r_linked tests/consumer_r2r.cpp tests/implementation_r2r.c)
+        target_link_libraries(consumer_r2r_linked PRIVATE notoriousfft m)
+        target_compile_definitions(consumer_r2r_linked PRIVATE NOTORIOUS_TEST_EXPECTED_VERSION="${PROJECT_VERSION}")
+        set_target_properties(consumer_r2r_linked PROPERTIES C_EXTENSIONS OFF CXX_EXTENSIONS OFF)
+        if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang" AND CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+            target_compile_options(consumer_r2r_linked PRIVATE -Wall -Wextra -Wpedantic -Werror)
+        endif()
+        add_test(NAME consumer_r2r_linked COMMAND consumer_r2r_linked)
+
+        find_package(Threads REQUIRED)
+        notoriousfft_add_executable_cpp(test_r2r_threads tests/test_r2r_threads.cpp)
+        target_link_libraries(test_r2r_threads PRIVATE Threads::Threads)
+        add_test(NAME test_r2r_threads COMMAND test_r2r_threads)
+
+        if(NOTORIOUS_FFT_VALIDATE_FFTW)
+            find_path(NOTORIOUS_FFT_FFTW_INCLUDE_DIR fftw3.h)
+            find_library(NOTORIOUS_FFT_FFTW_LIBRARY fftw3)
+            if(NOT NOTORIOUS_FFT_FFTW_INCLUDE_DIR OR NOT NOTORIOUS_FFT_FFTW_LIBRARY)
+                message(FATAL_ERROR "NOTORIOUS_FFT_VALIDATE_FFTW requires FFTW3 headers and library")
+            endif()
+            notoriousfft_add_executable(test_r2r_fftw tests/test_r2r.c)
+            target_compile_definitions(test_r2r_fftw PRIVATE NOTORIOUS_TEST_FFTW)
+            target_include_directories(test_r2r_fftw PRIVATE ${NOTORIOUS_FFT_FFTW_INCLUDE_DIR})
+            target_link_libraries(test_r2r_fftw PRIVATE ${NOTORIOUS_FFT_FFTW_LIBRARY})
+            add_test(NAME test_r2r_fftw COMMAND test_r2r_fftw)
+        endif()
+    elseif(NOTORIOUS_FFT_VALIDATE_FFTW)
+        message(FATAL_ERROR "The FFTW r2r validation gate requires double precision and accurate math")
+    endif()
 endif()
 
 # ---- Benchmarks ----

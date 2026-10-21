@@ -3,5 +3,6 @@ includedir=${prefix}/include
 
 Name: notoriousfft
 Description: Header-only FFT library with an FFTW-shaped planner API
-Version: 1.0.0
-Cflags: -I${includedir}
+Version: @PROJECT_VERSION@
+Cflags: -I${includedir} -D_POSIX_C_SOURCE=200112L
+Libs: -lm

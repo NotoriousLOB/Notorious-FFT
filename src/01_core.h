@@ -11,12 +11,13 @@
 #include <stddef.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <limits.h>
 #include <time.h>
 
 #define NOTORIOUS_FFT_VERSION_MAJOR 1
-#define NOTORIOUS_FFT_VERSION_MINOR 0
+#define NOTORIOUS_FFT_VERSION_MINOR 1
 #define NOTORIOUS_FFT_VERSION_PATCH 0
-#define NOTORIOUS_FFT_VERSION_STRING "1.0.0"
+#define NOTORIOUS_FFT_VERSION_STRING "1.1.0"
 
 #define NOTORIOUS_FFT_ALIGNMENT 64
 
@@ -134,6 +135,7 @@ typedef struct notorious_fft_aux {
     /* Pre-allocated scratch buffers to avoid per-call malloc in DFT wrapper */
     notorious_fft_real *scratch_re;
     notorious_fft_real *scratch_im;
+    int direct_r2r; /* 1D type-II/III direct fallback; scratch_im holds alias copy */
 } notorious_fft_aux;
 
 /* ============================================================================

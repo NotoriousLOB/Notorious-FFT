@@ -253,10 +253,10 @@ static void notorious_fft_iterative_inplace_cx(
 #elif NOTORIOUS_FFT_HAS_NEON && !defined(NOTORIOUS_FFT_SINGLE)
             /* NEON double: vld2q_f64 deinterleaves in hardware */
             for (; j + 2 <= half; j += 2) {
-                float64x2_t tw_r = (float64x2_t){tw_re[(j+0)*step], tw_re[(j+1)*step]};
+                float64x2_t tw_r = notorious_fft_neon_pair_f64(tw_re[(j+0)*step], tw_re[(j+1)*step]);
                 float64x2_t tw_i = inverse
-                    ? (float64x2_t){-tw_im[(j+0)*step], -tw_im[(j+1)*step]}
-                    : (float64x2_t){ tw_im[(j+0)*step],  tw_im[(j+1)*step]};
+                    ? notorious_fft_neon_pair_f64(-tw_im[(j+0)*step], -tw_im[(j+1)*step])
+                    : notorious_fft_neon_pair_f64( tw_im[(j+0)*step],  tw_im[(j+1)*step]);
 
                 float64x2x2_t ab = vld2q_f64(&data[2*(i+j)]);
                 float64x2x2_t cd = vld2q_f64(&data[2*(i+j+half)]);
@@ -630,10 +630,10 @@ static void notorious_fft_sr_dif_cx(int N, notorious_fft_real* x, notorious_fft_
 #elif NOTORIOUS_FFT_HAS_NEON && !defined(NOTORIOUS_FFT_SINGLE)
         /* NEON double: process 2 complex per iteration using vld2q_f64 deinterleave */
         for (; k + 2 <= n4; k += 2) {
-            float64x2_t w1r = (float64x2_t){ep[4*k],   ep[4*(k+1)]};
-            float64x2_t w1i = (float64x2_t){ep[4*k+1], ep[4*(k+1)+1]};
-            float64x2_t w3r = (float64x2_t){ep[4*k+2], ep[4*(k+1)+2]};
-            float64x2_t w3i = (float64x2_t){ep[4*k+3], ep[4*(k+1)+3]};
+            float64x2_t w1r = notorious_fft_neon_pair_f64(ep[4*k],   ep[4*(k+1)]);
+            float64x2_t w1i = notorious_fft_neon_pair_f64(ep[4*k+1], ep[4*(k+1)+1]);
+            float64x2_t w3r = notorious_fft_neon_pair_f64(ep[4*k+2], ep[4*(k+1)+2]);
+            float64x2_t w3i = notorious_fft_neon_pair_f64(ep[4*k+3], ep[4*(k+1)+3]);
 
             float64x2x2_t xa = vld2q_f64(xr + 2*k);
             float64x2x2_t xb = vld2q_f64(xr + 2*(k+N/2));
@@ -669,10 +669,10 @@ static void notorious_fft_sr_dif_cx(int N, notorious_fft_real* x, notorious_fft_
         }
 #elif NOTORIOUS_FFT_HAS_NEON && defined(NOTORIOUS_FFT_SINGLE)
         for (; k + 4 <= n4; k += 4) {
-            float32x4_t w1r = (float32x4_t){ep[4*k],   ep[4*(k+1)], ep[4*(k+2)], ep[4*(k+3)]};
-            float32x4_t w1i = (float32x4_t){ep[4*k+1], ep[4*(k+1)+1], ep[4*(k+2)+1], ep[4*(k+3)+1]};
-            float32x4_t w3r = (float32x4_t){ep[4*k+2], ep[4*(k+1)+2], ep[4*(k+2)+2], ep[4*(k+3)+2]};
-            float32x4_t w3i = (float32x4_t){ep[4*k+3], ep[4*(k+1)+3], ep[4*(k+2)+3], ep[4*(k+3)+3]};
+            float32x4_t w1r = notorious_fft_neon_quad_f32(ep[4*k],   ep[4*(k+1)], ep[4*(k+2)], ep[4*(k+3)]);
+            float32x4_t w1i = notorious_fft_neon_quad_f32(ep[4*k+1], ep[4*(k+1)+1], ep[4*(k+2)+1], ep[4*(k+3)+1]);
+            float32x4_t w3r = notorious_fft_neon_quad_f32(ep[4*k+2], ep[4*(k+1)+2], ep[4*(k+2)+2], ep[4*(k+3)+2]);
+            float32x4_t w3i = notorious_fft_neon_quad_f32(ep[4*k+3], ep[4*(k+1)+3], ep[4*(k+2)+3], ep[4*(k+3)+3]);
             float32x4x2_t xa = vld2q_f32(xr + 2*k);
             float32x4x2_t xb = vld2q_f32(xr + 2*(k+N/2));
             float32x4x2_t xc = vld2q_f32(xr + 2*(k+n4));
@@ -921,10 +921,10 @@ static void notorious_fft_sr_inv_dif_cx(int N, notorious_fft_real* x, notorious_
 
 #elif NOTORIOUS_FFT_HAS_NEON && !defined(NOTORIOUS_FFT_SINGLE)
         for (; k + 2 <= n4; k += 2) {
-            float64x2_t w1r = (float64x2_t){ep[4*k],   ep[4*(k+1)]};
-            float64x2_t w1i = (float64x2_t){ep[4*k+1], ep[4*(k+1)+1]};
-            float64x2_t w3r = (float64x2_t){ep[4*k+2], ep[4*(k+1)+2]};
-            float64x2_t w3i = (float64x2_t){ep[4*k+3], ep[4*(k+1)+3]};
+            float64x2_t w1r = notorious_fft_neon_pair_f64(ep[4*k],   ep[4*(k+1)]);
+            float64x2_t w1i = notorious_fft_neon_pair_f64(ep[4*k+1], ep[4*(k+1)+1]);
+            float64x2_t w3r = notorious_fft_neon_pair_f64(ep[4*k+2], ep[4*(k+1)+2]);
+            float64x2_t w3i = notorious_fft_neon_pair_f64(ep[4*k+3], ep[4*(k+1)+3]);
 
             float64x2x2_t xa = vld2q_f64(xr + 2*k);
             float64x2x2_t xb = vld2q_f64(xr + 2*(k+N/2));
@@ -963,10 +963,10 @@ static void notorious_fft_sr_inv_dif_cx(int N, notorious_fft_real* x, notorious_
         }
 #elif NOTORIOUS_FFT_HAS_NEON && defined(NOTORIOUS_FFT_SINGLE)
         for (; k + 4 <= n4; k += 4) {
-            float32x4_t w1r = (float32x4_t){ep[4*k],   ep[4*(k+1)], ep[4*(k+2)], ep[4*(k+3)]};
-            float32x4_t w1i = (float32x4_t){ep[4*k+1], ep[4*(k+1)+1], ep[4*(k+2)+1], ep[4*(k+3)+1]};
-            float32x4_t w3r = (float32x4_t){ep[4*k+2], ep[4*(k+1)+2], ep[4*(k+2)+2], ep[4*(k+3)+2]};
-            float32x4_t w3i = (float32x4_t){ep[4*k+3], ep[4*(k+1)+3], ep[4*(k+2)+3], ep[4*(k+3)+3]};
+            float32x4_t w1r = notorious_fft_neon_quad_f32(ep[4*k],   ep[4*(k+1)], ep[4*(k+2)], ep[4*(k+3)]);
+            float32x4_t w1i = notorious_fft_neon_quad_f32(ep[4*k+1], ep[4*(k+1)+1], ep[4*(k+2)+1], ep[4*(k+3)+1]);
+            float32x4_t w3r = notorious_fft_neon_quad_f32(ep[4*k+2], ep[4*(k+1)+2], ep[4*(k+2)+2], ep[4*(k+3)+2]);
+            float32x4_t w3i = notorious_fft_neon_quad_f32(ep[4*k+3], ep[4*(k+1)+3], ep[4*(k+2)+3], ep[4*(k+3)+3]);
             float32x4x2_t xa = vld2q_f32(xr + 2*k);
             float32x4x2_t xb = vld2q_f32(xr + 2*(k+N/2));
             float32x4x2_t xc = vld2q_f32(xr + 2*(k+n4));
@@ -1148,10 +1148,10 @@ static void notorious_fft_sr_dit_cx(int N, notorious_fft_real* z, const notoriou
 
 #if NOTORIOUS_FFT_HAS_NEON && !defined(NOTORIOUS_FFT_SINGLE)
     for (; k + 2 <= n4; k += 2) {
-        float64x2_t w1r = (float64x2_t){ep[4 * k], ep[4 * (k + 1)]};
-        float64x2_t w1i = (float64x2_t){ep[4 * k + 1], ep[4 * (k + 1) + 1]};
-        float64x2_t w3r = (float64x2_t){ep[4 * k + 2], ep[4 * (k + 1) + 2]};
-        float64x2_t w3i = (float64x2_t){ep[4 * k + 3], ep[4 * (k + 1) + 3]};
+        float64x2_t w1r = notorious_fft_neon_pair_f64(ep[4 * k], ep[4 * (k + 1)]);
+        float64x2_t w1i = notorious_fft_neon_pair_f64(ep[4 * k + 1], ep[4 * (k + 1) + 1]);
+        float64x2_t w3r = notorious_fft_neon_pair_f64(ep[4 * k + 2], ep[4 * (k + 1) + 2]);
+        float64x2_t w3i = notorious_fft_neon_pair_f64(ep[4 * k + 3], ep[4 * (k + 1) + 3]);
         float64x2x2_t uk = vld2q_f64(z + 2 * k);
         float64x2x2_t u2 = vld2q_f64(z + 2 * (k + n4));
         float64x2x2_t vv = vld2q_f64(z + 2 * (k + n2));
@@ -1258,10 +1258,10 @@ static void notorious_fft_sr_inv_dit_cx(int N, notorious_fft_real* z, const noto
 
 #if NOTORIOUS_FFT_HAS_NEON && !defined(NOTORIOUS_FFT_SINGLE)
     for (; k + 2 <= n4; k += 2) {
-        float64x2_t w1r = (float64x2_t){ep[4 * k], ep[4 * (k + 1)]};
-        float64x2_t w1i = (float64x2_t){ep[4 * k + 1], ep[4 * (k + 1) + 1]};
-        float64x2_t w3r = (float64x2_t){ep[4 * k + 2], ep[4 * (k + 1) + 2]};
-        float64x2_t w3i = (float64x2_t){ep[4 * k + 3], ep[4 * (k + 1) + 3]};
+        float64x2_t w1r = notorious_fft_neon_pair_f64(ep[4 * k], ep[4 * (k + 1)]);
+        float64x2_t w1i = notorious_fft_neon_pair_f64(ep[4 * k + 1], ep[4 * (k + 1) + 1]);
+        float64x2_t w3r = notorious_fft_neon_pair_f64(ep[4 * k + 2], ep[4 * (k + 1) + 2]);
+        float64x2_t w3i = notorious_fft_neon_pair_f64(ep[4 * k + 3], ep[4 * (k + 1) + 3]);
         float64x2x2_t uk = vld2q_f64(z + 2 * k);
         float64x2x2_t u2 = vld2q_f64(z + 2 * (k + n4));
         float64x2x2_t vv = vld2q_f64(z + 2 * (k + n2));
