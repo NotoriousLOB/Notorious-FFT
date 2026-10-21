@@ -230,8 +230,29 @@ static void roundtrip(int rank, const int *n) {
     free(x); free(y); free(ref);
 }
 
+static void assert_fft_backed(int n) {
+    notorious_fft_aux *a = notorious_fft_mkaux_t2t3_1d(n);
+    if (!a) {
+        fprintf(stderr, "mkaux_t2t3_1d(%d) failed\n", n);
+        ++failures;
+        return;
+    }
+    if (n >= 16 && (n & (n - 1)) && (a->direct_r2r || !a->plan ||
+        a->r2r_algo == NOTORIOUS_R2R_ALGO_DIRECT)) {
+        fprintf(stderr, "NPO2 DCT N=%d used quadratic path (direct=%d plan=%p algo=%d)\n",
+                n, a->direct_r2r, (void*)a->plan, a->r2r_algo);
+        ++failures;
+    }
+    notorious_fft_free_aux(a);
+}
+
 int main(void) {
-    const int lengths[] = {1,2,3,4,5,6,7,8,10,12,13,16,17,31,32,48,63,64,65,127,128,1024};
+    const int lengths[] = {1,2,3,4,5,6,7,8,10,12,13,16,17,31,32,48,63,64,65,127,128,
+                           255,256,257,258,509,511,512,513,514,1021,1024,1025};
+    const int path_ns[] = {16,17,31,63,64,65,127,128,255,256,257,258,509,511,512,513,514,
+                           1021,1024,1025,4093,4096};
+    for (size_t i = 0; i < sizeof(path_ns)/sizeof(*path_ns); ++i)
+        assert_fft_backed(path_ns[i]);
     const int s2[][2] = {{7,5},{16,16},{17,64},{63,65},{128,256},{32,48},{8,6},{5,7},{64,17},{1,7},{7,1},{1,1},{1,4},{4,1}};
     const int s3[][3] = {{4,8,3},{8,6,4},{8,10,6},{16,12,8},{64,48,32},{2,2,2},{3,3,3},{3,4,8},{8,3,4},{1,3,2},{3,1,2},{3,2,1},{1,1,1},{1,1,4},{1,4,1},{4,1,1}};
     const notorious_fft_r2r_kind all[] = {NOTORIOUS_FFT_REDFT10,NOTORIOUS_FFT_REDFT01,NOTORIOUS_FFT_REDFT11,

@@ -310,6 +310,13 @@ static void notorious_fft_execute_cx(
         return;
     }
 
+    if (plan->codelet) {
+        if (x_in != y_out)
+            memcpy(y_out, x_in, 2 * n * sizeof(notorious_fft_real));
+        notorious_fft_codelet_stride(y_out, (int)n, 1, inverse);
+        return;
+    }
+
     if (plan->rader_sub) {
         if (!inverse) {
             notorious_fft_execute_rader_cx(plan, x_in, y_out);
@@ -1335,7 +1342,7 @@ static void notorious_fft_execute_sr_dit(
         memcpy(y_out, z, 2 * (size_t)N * sizeof(notorious_fft_real));
 }
 
-/* Mixed-radix Cooley–Tukey, N = r × m, r ∈ {3,5}.
+/* Mixed-radix Cooley–Tukey, N = r × m, r a small codelet.
  * n = n1 + r n2,  k = m k1 + k2
  * 1) gather x[n1 + r n2] → tmp[n1 m + n2]
  * 2) m-point FFT of each n1-row
@@ -1349,7 +1356,7 @@ static void notorious_fft_execute_mixed_cx(const notorious_fft_plan* plan,
     const int n = (int)plan->n;
     const int m = n / r;
     notorious_fft_plan* sub = plan->mixed_sub;
-    if (!sub || (r != 3 && r != 5 && r != 7) || m < 1 || !plan->sr_t) return;
+    if (!sub || r < 2 || m < 1 || !plan->sr_t) return;
 
     notorious_fft_real* tmp = plan->sr_t;
     for (int n1 = 0; n1 < r; n1++) {
@@ -1365,29 +1372,12 @@ static void notorious_fft_execute_mixed_cx(const notorious_fft_plan* plan,
         notorious_fft_execute_cx(sub, tmp + (size_t)n1 * m * 2,
                                  tmp + (size_t)n1 * m * 2, inverse);
 
-    const notorious_fft_real* tw_re = plan->tw_re;
-    const notorious_fft_real* tw_im = plan->tw_im;
-    if (tw_re && tw_im) {
-        for (int n1 = 1; n1 < r; n1++) {
-            for (int k2 = 0; k2 < m; k2++) {
-                size_t ti = (size_t)(n1 - 1) * (size_t)m + (size_t)k2;
-                size_t oi = ((size_t)n1 * (size_t)m + (size_t)k2) * 2;
-                notorious_fft_real wr = tw_re[ti];
-                notorious_fft_real wi = inverse ? -tw_im[ti] : tw_im[ti];
-                notorious_fft_real ur = tmp[oi], ui = tmp[oi + 1];
-                tmp[oi]     = ur * wr - ui * wi;
-                tmp[oi + 1] = ur * wi + ui * wr;
-            }
-        }
-    }
-
-    for (int k2 = 0; k2 < m; k2++) {
-        if (r == 3)
-            notorious_fft_radix3_stride(tmp + 2 * k2, m, inverse);
-        else if (r == 5)
-            notorious_fft_radix5_stride(tmp + 2 * k2, m, inverse);
-        else
-            notorious_fft_radix7_stride(tmp + 2 * k2, m, inverse);
+    notorious_fft_mixed_apply_twiddles(tmp, plan->tw_re, plan->tw_im, r, m, inverse);
+    if (r == 3 || r == 5 || r == 7)
+        notorious_fft_mixed_radix_across(tmp, r, m, inverse);
+    else {
+        for (int k2 = 0; k2 < m; k2++)
+            notorious_fft_codelet_stride(tmp + 2 * k2, r, m, inverse);
     }
 
     if (y_out != tmp)

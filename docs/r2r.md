@@ -27,13 +27,27 @@ and both type-IV transforms return `sqrt(2)*x[0]`. These transforms are not
 orthonormal. Applying the inverse kinds along all axes gives a scale of
 `Π_axis (2*n[axis])`; divide by this product to recover the original input.
 
-The verified power-of-two DCT-II/III embeddings retain their FFT/SIMD
-kernels. Length one and all other lengths use direct quadratic evaluation
-with linear workspace. There is no measured crossover threshold or arbitrary
-length fast-path claim in this milestone. Large non-power-of-two axes can be
-slow. The legacy `mkaux_t2t3_*` constructors also accept these lengths;
-their shared auxiliary additionally evaluates DST-II/III directly on fallback
-lengths, but arbitrary-length DST is outside the FFTW-shaped support contract.
+Power-of-two DCT-II/III keep the packed real-DFT + SIMD post-process kernels.
+Every other positive length uses an FFT-backed O(N log N) embedding: even/odd
+reordering, a real or complex FFT (mixed-radix, Rader, or Bluestein), and a
+precomputed phase. Even N packs through an N/2-point complex FFT. Length one
+is the closed form `2*x[0]` (DCT-II) / `x[0]` (DCT-III). Planning allocates
+the child FFT, twiddles, and scratch; execution does not allocate, call
+`sin`/`cos`, or create plans. A 2N even-extension complex FFT is available
+behind `NOTORIOUS_FFT_R2R_DCT_2N` and is not the default. Isolated DCT
+speed is O(N log N); it matches FFTW at some primes (N=257). Composite
+lengths use mixed-radix with small-N codelets (3, 5, 7, 9, 11, 13, 15, 17,
+19, 21, 27, 43) and SIMD 3/5/7 across consecutive k2 columns (513 = 27×19,
+258's packed 129 = 43×3). Isolated REDFT10 medians on Jetson Orin Nano
+(Clang 22, `-O3`, FFTW 3.3.8 ESTIMATE, 2026-10-21) stay within ~1.6× FFTW
+at N=257/258/511/513; see the README receipts table and
+[benchmarks/results/jetson_orin_nano_r2r_dct.csv](../benchmarks/results/jetson_orin_nano_r2r_dct.csv).
+API compatibility is a scaling and layout contract.
+
+The legacy `mkaux_t2t3_*` constructors accept the same DCT lengths. DST-II/III
+on those auxiliaries still use the quadratic kernel for non-power-of-two
+sizes. Arbitrary-length DST remains outside the FFTW-shaped support contract
+(RODFT10/01 are power-of-two only).
 
 ## Layout, arrays, and execution
 
@@ -102,14 +116,14 @@ selection and is outside this r2r compatibility claim.
 
 ## Tested compatibility subset
 
-| Function/family | Support in this milestone | Validation | Restrictions |
+| Function/family | Support | Validation | Restrictions |
 | --- | --- | --- | --- |
 | `plan_r2r_1d/2d/3d` | Native constructors and FFTW aliases; independent kind per axis | Direct formulas, FFTW3, inverse scales, all PLAN.md reproductions | Six kinds and lengths above; contiguous rank 1–3 |
 | `execute` / `execute_r2r` | Bound and replacement arrays | In-place, disjoint, input preservation, repeated execution, asymmetric axes | Partial overlap unsupported; shared plan needs synchronization |
 | `destroy_plan` | Complete and partial construction cleanup | Every allocation failed in representative paths; ASan/UBSan/leak gate | NULL accepted |
 | `malloc/free`, `alloc_real/complex` | Aligned allocations with checked byte counts | Consumer smoke builds, overflow and lifecycle checks | Available memory/object-size limits |
 | Generic-rank, many, guru, strided or batched r2r | Not implemented | No compatibility claim | Deferred |
-| Other FFTW APIs | Existing support retained | Existing C/C++ regression suite | No expanded FFTW differential claim in this milestone |
+| Other FFTW APIs | Existing support retained | Existing C/C++ regression suite | r2r and r2c gates as documented |
 
 The numerical suite checks both directions independently, every ordered
 pair/triple of six kinds on asymmetric small power-of-two tensors, prime

@@ -1,8 +1,19 @@
 # FFT Benchmarks
 
-This directory contains comprehensive benchmarks for the NotoriousFFT library.
+v1.1.2 numbers live in the [README receipts](../README.md#the-receipts)
+and [results/jetson_orin_nano_r2r_dct.csv](results/jetson_orin_nano_r2r_dct.csv).
+Run on Jetson Orin Nano / Cortex-A78AE, Clang 22, `-O3`, `taskset -c 0`.
 
 ## Available Benchmarks
+
+### 0. Isolated DCT vs FFTW (`bench_r2r_dct.c`)
+
+Execute-only REDFT10/REDFT01 medians at 256–513. Links FFTW3 when CMake finds it.
+
+```bash
+cmake --build build --target bench_r2r_dct
+taskset -c 0 ./build/bench_r2r_dct
+```
 
 ### 1. Basic Benchmark (`bench.c`)
 
@@ -28,16 +39,11 @@ make comprehensive_bench
 ./comprehensive_bench --transform complex_dft   # Specific transform
 ```
 
-### 3. Mixed Sizes Benchmark (`bench_mixed_sizes.c`) ⭐ NEW
+### 3. Mixed Sizes Benchmark (`bench_mixed_sizes.c`)
 
-Enhanced benchmark with non-power-of-2 sizes, prime sizes, and multi-dimensional transforms (1D-4D).
-
-**Note:** This benchmark is designed to test NotoriousFFT's support for arbitrary sizes via Bluestein's algorithm.
-- ✅ **1D Power-of-2**: Fully working (NotoriousFFT vs minfft comparison)
-- ✅ **1D NPO2**: Supported if NotoriousFFT has Bluestein implementation
-- ⚠️ **1D Prime**: Requires complete Bluestein implementation in NotoriousFFT
-- ✅ **2D**: Working for power-of-2 sizes (minfft-compatible)
-- ⚠️ **3D/4D**: Experimental - may be slow for large sizes
+Non-power-of-two, prime, and multi-dimensional sizes (1D–4D). minfft only
+covers power-of-two; Notorious FFT uses codelets, mixed-radix, Rader, or
+Bluestein for the rest.
 
 ```bash
 cd build && make bench_mixed_sizes
@@ -240,12 +246,10 @@ For multi-dimensional results (`bench_mixed_sizes`):
 
 ### Multi-Dimensional Support
 - **minfft**: Power-of-2 only, any dimensionality
-- **NotoriousFFT**: Arbitrary sizes via Bluestein's algorithm, any dimensionality
+- **NotoriousFFT**: Any positive length (codelets, mixed-radix, Rader, Bluestein)
 
-The `bench_mixed_sizes` benchmark demonstrates NotoriousFFT's ability to handle:
-- Prime-sized dimensions (e.g., 127, 257, 1009)
-- Non-power-of-2 dimensions (e.g., 100, 200, 500)
-- Up to 4-dimensional transforms
+`bench_mixed_sizes` covers primes (127, 257, 1009), composites (100, 210),
+and up to 4-D tensors.
 
 ### GFLOP/s Calculation
 - **1D Complex DFT**: `5 * N * log2(N)` operations
@@ -267,8 +271,8 @@ The `bench_mixed_sizes` benchmark demonstrates NotoriousFFT's ability to handle:
 
 ## Library-Specific Notes
 
-- **FFTW3**: Uses `FFTW_MEASURE` planning mode for fair comparison
-- **muFFT**: Uses single-precision floats internally
-- **KissFFT**: Portable implementation without explicit SIMD
-- **minfft**: Split-radix algorithm, power-of-2 only
-- **NotoriousFFT**: Split-radix for power-of-2, Bluestein for arbitrary sizes, SIMD optimizations
+- **FFTW3**: `comprehensive_bench` uses `FFTW_MEASURE`; `bench_r2r_dct` uses `FFTW_ESTIMATE`
+- **muFFT**: Single-precision internally
+- **KissFFT**: Portable, no explicit SIMD
+- **minfft**: Split-radix, power-of-two only
+- **NotoriousFFT**: Split-radix, codelets 3–43, mixed-radix, Rader, Bluestein; SIMD at compile time

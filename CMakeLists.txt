@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.14)
-project(notoriousfft VERSION 1.1.1 LANGUAGES C CXX)
+project(notoriousfft VERSION 1.1.2 LANGUAGES C CXX)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
@@ -285,6 +285,15 @@ if(NOTORIOUS_FFT_BUILD_BENCHMARKS)
     notoriousfft_add_executable(bench_mixed_sizes benchmarks/bench_mixed_sizes.c)
     target_link_libraries(bench_mixed_sizes PRIVATE minfft)
     target_include_directories(bench_mixed_sizes PRIVATE ${minfft_SOURCE_DIR})
+
+    notoriousfft_add_executable(bench_r2r_dct benchmarks/bench_r2r_dct.c)
+    find_path(NOTORIOUS_FFT_FFTW_INCLUDE_DIR fftw3.h)
+    find_library(NOTORIOUS_FFT_FFTW_LIBRARY fftw3)
+    if(NOTORIOUS_FFT_FFTW_INCLUDE_DIR AND NOTORIOUS_FFT_FFTW_LIBRARY)
+        target_compile_definitions(bench_r2r_dct PRIVATE NOTORIOUS_TEST_FFTW)
+        target_include_directories(bench_r2r_dct PRIVATE ${NOTORIOUS_FFT_FFTW_INCLUDE_DIR})
+        target_link_libraries(bench_r2r_dct PRIVATE ${NOTORIOUS_FFT_FFTW_LIBRARY})
+    endif()
 endif()
 
 # ---- Examples ----

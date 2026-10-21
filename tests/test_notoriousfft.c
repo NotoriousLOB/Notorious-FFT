@@ -932,7 +932,8 @@ int main(void) {
 
 	printf("\n=== Non-Power-of-2 / Bluestein DFT ===\n");
 	{
-		int bluestein_sizes[] = {3, 5, 6, 7, 9, 10, 12, 14, 15, 18, 20, 21, 25, 27, 35, 48, 49, 100};
+		int bluestein_sizes[] = {3, 5, 6, 7, 9, 10, 12, 14, 15, 18, 20, 21, 25, 27, 35, 43, 48, 49,
+		                         86, 100, 129, 171, 258, 511, 513};
 		int nb = sizeof(bluestein_sizes) / sizeof(bluestein_sizes[0]);
 		for (int i = 0; i < nb; i++)
 			test_dft_bluestein(bluestein_sizes[i]);
@@ -940,7 +941,8 @@ int main(void) {
 
 	printf("\n=== Inverse Bluestein (unnormalized) ===\n");
 	{
-		int bluestein_sizes[] = {3, 5, 6, 7, 9, 10, 12, 14, 15, 18, 20, 21, 25, 27, 35, 48, 49, 100};
+		int bluestein_sizes[] = {3, 5, 6, 7, 9, 10, 12, 14, 15, 18, 20, 21, 25, 27, 35, 43, 48, 49,
+		                         86, 100, 129, 171, 258, 511, 513};
 		int nb = sizeof(bluestein_sizes) / sizeof(bluestein_sizes[0]);
 		for (int i = 0; i < nb; i++)
 			test_invdft_bluestein(bluestein_sizes[i]);
@@ -948,10 +950,10 @@ int main(void) {
 
 	printf("\n=== Prime / Rader (incl. Mersenne 31,127 and Fermat 17,257) ===\n");
 	{
-		/* 11,13,17,19,31,37,61,127,257: N−1 is 2·3·5·7-smooth → Rader.
+		/* 11,13,17,19,43: hard codelets. 31,37,61,127,257: Rader (smooth N−1).
 		 * 23,47,53,67: N−1 not smooth → Bluestein (covers AVX inverse IFFT).
-		 * 255=3·5·17 mixed+Rader. */
-		int prime_sizes[] = {11, 13, 17, 19, 23, 31, 37, 47, 53, 61, 67, 127, 255, 257};
+		 * 255=3·5·17 mixed+codelet. */
+		int prime_sizes[] = {11, 13, 17, 19, 23, 31, 37, 43, 47, 53, 61, 67, 127, 255, 257};
 		int np = sizeof(prime_sizes) / sizeof(prime_sizes[0]);
 		for (int i = 0; i < np; i++)
 			test_dft_bluestein(prime_sizes[i]);

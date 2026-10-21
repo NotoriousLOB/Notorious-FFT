@@ -270,10 +270,36 @@ static notorious_fft_plan* notorious_fft_create_plan_power2(size_t n) {
  * Main Plan API
  * ============================================================================ */
 
+static int notorious_fft_pick_mixed_radix(size_t n) {
+    /* Largest small codelet that strictly divides n. Puts the cofactor on
+     * contiguous rows (513 = 27 × 19, 258 = 43 × 6, 129 = 43 × 3). */
+    static const int rads[] = {43, 27, 21, 19, 17, 15, 13, 11, 9, 7, 5, 3};
+    for (size_t i = 0; i < sizeof(rads) / sizeof(rads[0]); i++) {
+        int r = rads[i];
+        if ((size_t)r >= n) continue;
+        if (n % (size_t)r == 0 && n / (size_t)r > 1)
+            return r;
+    }
+    return 0;
+}
+
+static notorious_fft_plan* notorious_fft_create_plan_codelet(size_t n) {
+    if (!notorious_fft_is_codelet(n) || n > INT_MAX / 2) return NULL;
+    size_t total = NOTORIOUS_FFT_SLAB_FIELD(sizeof(notorious_fft_plan));
+    void* slab = notorious_fft_malloc(total);
+    if (!slab) return NULL;
+    notorious_fft_plan* plan = (notorious_fft_plan*)slab;
+    memset(plan, 0, sizeof(*plan));
+    plan->slab = slab;
+    plan->n = n;
+    plan->codelet = 1;
+    return plan;
+}
+
 static notorious_fft_plan* notorious_fft_create_plan_mixed(size_t n) {
     if (n == 0 || n > INT_MAX / 2) return NULL;
-    int radix = (n % 7u == 0) ? 7 : (n % 5u == 0) ? 5 : 3;
-    if (n % (size_t)radix != 0) return NULL;
+    int radix = notorious_fft_pick_mixed_radix(n);
+    if (radix < 2 || n % (size_t)radix != 0) return NULL;
     size_t m = n / (size_t)radix;
 
     size_t tw_count = (size_t)(radix - 1) * m;
@@ -388,8 +414,10 @@ static notorious_fft_plan* notorious_fft_create_plan(size_t n, int inverse) {
     if (n == 0 || n > INT_MAX / 2) return NULL;
     if ((n & (n - 1)) == 0)
         return notorious_fft_create_plan_power2(n);
-    /* Peel 3/5/7 even when the cofactor is prime (Rader) or awkward (Bluestein). */
-    if (n % 7u == 0 || n % 5u == 0 || n % 3u == 0) {
+    if (notorious_fft_is_codelet(n))
+        return notorious_fft_create_plan_codelet(n);
+    /* Peel the largest small codelet; cofactor may be codelet, Rader, or mixed. */
+    if (notorious_fft_pick_mixed_radix(n)) {
         return notorious_fft_create_plan_mixed(n);
     }
     if (n >= 11 && notorious_fft_is_prime(n) && notorious_fft_is_2357_smooth(n - 1)) {

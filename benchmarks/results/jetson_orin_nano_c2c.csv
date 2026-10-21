@@ -1,0 +1,19 @@
+# Isolated complex C2C execute medians (microseconds)
+# platform: NVIDIA Jetson Orin Nano, Cortex-A78AE, 6 cores
+# compiler: Clang 22.1.3, -O3 -DNDEBUG -march=armv8.2-a+dotprod+fp16
+# fftw: 3.3.8 FFTW_ESTIMATE, double, warmup 4–20, steady 20–80, taskset -c 0
+# measured: 2026-10-21
+# commit: a6f8d0e Fast arbitrary-length DCT-II/III for v1.1.2
+N,notorious_us,fftw_us,ratio
+16,0.1280,0.0960,1.333
+64,0.5440,0.5760,0.944
+256,2.7520,2.7840,0.989
+257,7.0080,9.7930,0.716
+258,11.9680,7.3920,1.619
+511,20.3210,21.6650,0.938
+512,6.1440,6.3040,0.975
+513,10.0170,11.0090,0.910
+1024,13.6650,14.6240,0.934
+4096,68.1940,72.5780,0.940
+16384,336.1710,376.7480,0.892
+65536,1660.2420,2002.4290,0.829

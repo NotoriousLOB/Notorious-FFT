@@ -16,8 +16,8 @@
 
 #define NOTORIOUS_FFT_VERSION_MAJOR 1
 #define NOTORIOUS_FFT_VERSION_MINOR 1
-#define NOTORIOUS_FFT_VERSION_PATCH 1
-#define NOTORIOUS_FFT_VERSION_STRING "1.1.1"
+#define NOTORIOUS_FFT_VERSION_PATCH 2
+#define NOTORIOUS_FFT_VERSION_STRING "1.1.2"
 
 #define NOTORIOUS_FFT_ALIGNMENT 64
 
@@ -90,9 +90,10 @@ typedef struct notorious_fft_plan {
     notorious_fft_real *sr_e;      /* Split-radix exponent table — same layout as minfft */
     notorious_fft_real *sr_t;      /* Temp buffer for split-radix (n complex = 2*n reals) */
 
-    /* Mixed-radix Cooley–Tukey (N = radix × m, radix ∈ {3,5,7}) */
+    /* Mixed-radix Cooley–Tukey (N = radix × m, radix a small codelet) */
     int mixed_radix;        /* 0 = not mixed-radix */
     struct notorious_fft_plan *mixed_sub;  /* Plan for length m = n/radix */
+    int codelet;            /* 1 = leaf DFT of size n ∈ {3,5,7,9,11,13,15,17,19,21,27,43} */
 
     /* Rader: prime N with (N-1) 2·3·5·7-smooth. Convolution length N-1. */
     struct notorious_fft_plan *rader_sub;
@@ -125,6 +126,18 @@ typedef struct notorious_fft_plan {
 
 } notorious_fft_plan;
 
+/* 1D type-II/III algorithm. direct_r2r stays 1 only for the quadratic kernel. */
+#define NOTORIOUS_R2R_ALGO_NONE          0
+#define NOTORIOUS_R2R_ALGO_DIRECT        1
+#define NOTORIOUS_R2R_ALGO_POW2_REALDFT  2
+#define NOTORIOUS_R2R_ALGO_DCT_FFT_N     3
+#define NOTORIOUS_R2R_ALGO_DCT_FFT_2N    4
+
+#ifndef NOTORIOUS_FFT_R2R_DCT_2N
+/* 0: N-point even/odd packing (default). 1: 2N even-extension complex FFT. */
+#define NOTORIOUS_FFT_R2R_DCT_2N 0
+#endif
+
 /* Legacy aux structure for API compatibility */
 typedef struct notorious_fft_aux {
     int N;
@@ -136,6 +149,7 @@ typedef struct notorious_fft_aux {
     notorious_fft_real *scratch_re;
     notorious_fft_real *scratch_im;
     int direct_r2r; /* 1D type-II/III direct fallback; scratch_im holds alias copy */
+    int r2r_algo;   /* NOTORIOUS_R2R_ALGO_*; not a public selector */
 } notorious_fft_aux;
 
 /* ============================================================================

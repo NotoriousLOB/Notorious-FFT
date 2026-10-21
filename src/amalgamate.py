@@ -32,7 +32,7 @@ HEADER = """\
  * Edit the module files in src/ and re-run CMake.
  *
  * Features:
- *   - Split-radix DIF (DIT under MEASURE), mixed-radix 3/5/7, Rader, Bluestein
+ *   - Split-radix DIF (DIT under MEASURE), codelets 3–43, mixed-radix, Rader, Bluestein
  *   - SIMD: NEON, AVX2, AVX-512 (compile-time)
  *   - FFTW-shaped planner API (see notorious_fft_fftw.h)
  *   - OpenMP for large independent batches

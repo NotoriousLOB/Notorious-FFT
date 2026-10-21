@@ -1,5 +1,9 @@
 # Real DFTs (v1.1.1)
 
+Packing, signs, and inverse scales are unchanged in v1.1.2. That release
+speeds the child complex FFT (codelets, mixed-radix peel) used by odd-N
+and composite r2c; it does not change this contract.
+
 Native `notorious_fft_plan_dft_r2c_1d/2d` and
 `notorious_fft_plan_dft_c2r_1d/2d`, and their `fftw_*` compatibility aliases,
 accept positive lengths in prime, odd, composite, and power-of-two size

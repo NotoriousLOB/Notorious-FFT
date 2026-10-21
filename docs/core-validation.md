@@ -1,5 +1,11 @@
 # v1.1.0 core correctness validation
 
+This is the v1.1.0 r2r-correctness record. v1.1.1 added arbitrary-length
+real DFTs ([real-dft.md](real-dft.md)). v1.1.2 replaced the quadratic
+NPO2 DCT-II/III kernel with an FFT-backed path; the formulas, flags, and
+aliasing contract in [r2r.md](r2r.md) still apply. Do not use the
+“direct fallback remains quadratic” paragraph below as current behavior.
+
 Baseline: `83142da40558f2242e7988c821207b60c8c7185d`, the pinned revision
 named in PLAN.md. The repository started clean. No CHEAP repository or
 dependency pins were changed. External CHEAP CI logs were not present; the local gate addresses

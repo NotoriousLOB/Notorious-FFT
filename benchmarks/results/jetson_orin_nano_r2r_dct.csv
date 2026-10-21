@@ -1,0 +1,19 @@
+# Isolated REDFT10/REDFT01 execute medians (microseconds)
+# platform: NVIDIA Jetson Orin Nano, Cortex-A78AE, 6 cores
+# compiler: Clang 22.1.3, -O3 -DNDEBUG -march=armv8.2-a+dotprod+fp16
+# fftw: 3.3.8 FFTW_ESTIMATE, double, warmup=8, steady=40, taskset -c 0
+# measured: 2026-10-21
+# commit: a6f8d0e Fast arbitrary-length DCT-II/III for v1.1.2
+N,kind,notorious_us,fftw_us,ratio,algo
+256,REDFT10,2.304,2.240,1.029,pow2-realdft
+256,REDFT01,2.176,2.177,1.000,pow2-realdft
+257,REDFT10,7.809,7.968,0.980,fft-N
+257,REDFT01,8.288,7.937,1.044,fft-N
+258,REDFT10,5.440,4.960,1.097,fft-N
+258,REDFT01,5.312,4.929,1.078,fft-N
+511,REDFT10,21.985,14.273,1.540,fft-N
+511,REDFT01,23.041,14.240,1.618,fft-N
+512,REDFT10,4.832,4.640,1.041,pow2-realdft
+512,REDFT01,4.640,4.608,1.007,pow2-realdft
+513,REDFT10,11.648,7.648,1.523,fft-N
+513,REDFT01,12.001,7.520,1.596,fft-N

@@ -3,43 +3,12 @@
   <source media="(prefers-color-scheme: dark)" srcset="/.github/images/logo.png">
   <source media="(prefers-color-scheme: light)" srcset="/.github/images/logo.png">
   <img src="/.github/images/logo.png" width="480" alt="Notorious FFT" >
-</picture>	
+</picture>
 </p>
 
-A header-only Fast Fourier Transform library for C/C++.
+# Notorious FFT
 
-Notorious FFT provides complex Fourier and cosine/sine transforms in a single header file with no dependencies beyond the C standard library.
-
-## Features
-
-- **Header-only**: single file `include/notorious_fft.h`, just `#include` and go
-- **FFTW-shaped planner**: `plan_dft_*` / `execute` / `destroy_io_plan`, plus `include/notorious_fft_fftw.h` aliases
-- **Native 1D/2D/3D r2r plans**: arbitrary positive-length DCT-II/III, row-major tensors, mixed DCT/DST axes, and reusable workspace; see the [r2r contract and validation gate](docs/r2r.md)
-- **Transform families**: complex DFT, real DFT (including 2D/3D r2c), DCT-2/3/4, DST-2/3/4
-- **Any complex DFT size**: split-radix for powers of two, mixed-radix 3/5/7, Rader for primes with smooth N−1, Bluestein otherwise
-- **SIMD**: NEON, AVX2, AVX-512 selected at compile time (not stubs)
-- **Single and double precision**: define `NOTORIOUS_FFT_SINGLE` for float, default is double
-- **Version**: 1.1.1 (`NOTORIOUS_FFT_VERSION_*`)
-
-v1.1.1 extends 1D/2D R2C and C2R planning to prime, odd, and composite
-lengths, fixes padded in-place real layouts, and preserves disjoint C2R
-input. Packing, signs, Hermitian symmetry, and inverse scales are checked
-against direct DFT formulas and FFTW3; see [the real-DFT contract](docs/real-dft.md).
-
-v1.1.0 adds arbitrary-length DCT-II/III and native row-major 2D/3D r2r
-plans with independent kinds per axis. It hardens planning failure cleanup,
-fixes small in-place and unit-axis transforms, and adds independent formula,
-FFTW, allocation-failure, sanitizer, and strict consumer validation. The
-arbitrary-length fallback is quadratic; see [the supported subset](docs/r2r.md).
-
-### Accuracy Modes
-
-- **Default**: Machine-precision twiddle factors using standard library sin/cos
-- **Fast math**: Define `NOTORIOUS_FFT_FAST_MATH` for Bhaskara I approximation (~0.1% max error). Only suitable for small N or applications tolerant of ~1% output error, as errors accumulate across FFT stages.
-
-## Quick Start
-
-Planner API (recommended):
+**Header-only FFT for C and C++. One mic, one file, an FFTW-shaped planner, and an O(N log N) cosine transform at every positive length.**
 
 ```c
 #define NOTORIOUS_FFT_IMPLEMENTATION
@@ -47,258 +16,243 @@ Planner API (recommended):
 
 notorious_fft_cmpl *x = notorious_fft_malloc(1024 * sizeof(notorious_fft_cmpl));
 notorious_fft_cmpl *y = notorious_fft_malloc(1024 * sizeof(notorious_fft_cmpl));
-/* ... fill x ... */
 notorious_fft_io_plan *p = notorious_fft_plan_dft_1d(
     1024, x, y, NOTORIOUS_FFT_FORWARD, NOTORIOUS_FFT_ESTIMATE);
 notorious_fft_execute(p);
 notorious_fft_destroy_io_plan(p);
-notorious_fft_free(x);
-notorious_fft_free(y);
 ```
 
-Drop-in FFTW3 subset (`examples/fftw_compat.c`):
+It was all a dream: one translation unit defines the implementation macro, everyone else includes the header, you link `libm`. Plan, execute, destroy. That's the whole session.
+
+---
+
+## On the record
+
+Notorious FFT is the vendorable FFTW dialect. You drop in a header, you keep the planner verbs your code already knows, and you get a real transform for sizes FFTW would also accept.
+
+- **One file.** `include/notorious_fft.h` is amalgamated from `src/01_core.h`–`src/08_api.h`. C++17 lives in `notorious_fft.hpp`. The `fftw_*` aliases live in `notorious_fft_fftw.h` ([`examples/fftw_compat.c`](examples/fftw_compat.c)).
+- **Any complex length.** Split-radix DIF on powers of two. Hard codelets for 3, 5, 7, 9, 11, 13, 15, 17, 19, 21, 27, 43. Mixed-radix peels the largest of those (513 = 27×19, 129 = 43×3). Rader when N−1 is 2·3·5·7-smooth. Bluestein for the leftovers.
+- **Real, cosine, sine.** Packed r2c/c2r including 2D/3D. DCT-II/III at every positive `int` length. DCT-IV and DST-II/III/IV on powers of two. Inverses are unnormalized, FFTW-style: `IDFT(DFT(x)) = N·x`.
+- **SIMD you already asked for.** NEON, AVX2, AVX-512 follow `-march`. OpenMP follows `-fopenmp`.
+
+Thirty-six chambers, one execute call. The planner picks the chamber.
+
+## Studio rules
+
+A plan owns its scratch. Two threads on the same plan will step on each other; two plans will not. **C.R.E.A.M.** — cache rules everything around me — which is why the engine lives in one 64-byte-aligned slab.
+
+`ESTIMATE` is estimate. r2r `MEASURE` / `PATIENT` / `EXHAUSTIVE` are stored and then ignored as a search. Complex DFT has a limited MEASURE path. Nobody here writes a wisdom file.
+
+The amalgam is fat on purpose: v1.1.2 is ~8.5k lines / 470 KB of unrolled codelets. You pay at compile time, once.
+
+FFTW3 with a long `MEASURE` plan is still Dre in the booth. We print our ESTIMATE numbers next to ESTIMATE FFTW, which is the flag the compatibility header actually sends.
+
+DST-II/III on the FFTW-shaped r2r API are power-of-two. DCT-IV/DST-IV are power-of-two. Partial buffer overlap is unsupported. Multi-dimensional c2r may overwrite its input; disjoint 1D/2D r2c input is preserved. Contracts: [docs/r2r.md](docs/r2r.md), [docs/real-dft.md](docs/real-dft.md).
+
+---
+
+## Life After Death — 1.1.2
+
+The quadratic NPO2 DCT is dead. Even lengths pack through an N/2-point real DFT. Odd lengths run an N-point FFT and a precomputed phase. A 257-point DCT is still 257 points. REDFT10/01 scaling is still FFTW's unnormalized 2N.
+
+Codelets and a greedy mixed-radix peel put 513 on 27×19 and packed 129 (DCT 258) on 43. SIMD still walks mixed-radix 3/5/7 across consecutive columns.
+
+On Jetson Orin Nano, isolated REDFT10 at 257/258/511/513 stays inside ~1.6× FFTW 3.3.8 ESTIMATE. Complex C2C at 257, 511, and 513 is ahead of that same FFTW. Receipts below.
+
+**1.1.1** — arbitrary-length 1D/2D r2c/c2r, padded in-place rows, disjoint C2R input kept. [docs/real-dft.md](docs/real-dft.md).
+
+**1.1.0** — native 1D/2D/3D r2r, one kind per axis, planning-failure cleanup. [docs/core-validation.md](docs/core-validation.md).
+
+---
+
+## You Can Do It
+
+C11 compiler, `libm`, and CMake ≥ 3.14 if you want tests.
 
 ```c
 #define NOTORIOUS_FFT_IMPLEMENTATION
 #include "notorious_fft.h"
+```
+
+Exactly one `.c` / `.cpp` gets the macro.
+
+```bash
+cc -O3 -march=native -o fft fft.c -lm
+```
+
+`-DNOTORIOUS_FFT_SINGLE` for float. `-DNOTORIOUS_FFT_FAST_MATH` for Bhaskara twiddles (~0.1% per factor, accumulates). Leave `-ffast-math` off if you want libm.
+
+```bash
+git clone https://github.com/NotoriousLOB/Notorious-FFT.git
+cd Notorious-FFT
+cmake -S . -B build
+cmake --build build -j
+ctest --test-dir build --output-on-failure
+./build/example_basic
+```
+
+Differential vs FFTW3: `-DNOTORIOUS_FFT_VALIDATE_FFTW=ON`.
+
+---
+
+## The Blueprint
+
+```c
+notorious_fft_io_plan *p = notorious_fft_plan_dft_1d(
+    n, in, out, NOTORIOUS_FFT_FORWARD, NOTORIOUS_FFT_ESTIMATE);
+if (!p) return 1;
+notorious_fft_execute(p);
+notorious_fft_destroy_io_plan(p);
+```
+
+FFTW aliases — keep `notorious_fft_fftw.h` and `<fftw3.h>` in separate translation units:
+
+```c
+#include "notorious_fft.h"
 #include "notorious_fft_fftw.h"
 
-fftw_complex *in = fftw_alloc_complex(1024);
-fftw_complex *out = fftw_alloc_complex(1024);
-fftw_plan p = fftw_plan_dft_1d(1024, in, out, FFTW_FORWARD, FFTW_ESTIMATE);
+fftw_plan p = fftw_plan_dft_1d(n, in, out, FFTW_FORWARD, FFTW_ESTIMATE);
 fftw_execute(p);
 fftw_destroy_plan(p);
 ```
 
-Do not mix `notorious_fft_fftw.h` with linking `libfftw3` in the same translation unit.
-
-**Thread safety:** concurrent `execute` on the **same** plan is not supported (plans own scratch). Distinct plans may run in parallel.
-
-Inverse DFTs are **unnormalized** (same as FFTW): a round-trip is `IDFT(DFT(x)) = N·x`.
-Multi-dimensional c2r/invrealdft may overwrite its input.
-
-### C++ Usage
+C++:
 
 ```cpp
-#define NOTORIOUS_FFT_IMPLEMENTATION
-#include "notorious_fft.h"
 #include "notorious_fft.hpp"
-
-// RAII aux data - automatically freed
 auto a = notorious_fft::mkaux_dft_1d(1024);
 notorious_fft::dft(x, y, a);
-
-// Or use the vector convenience API
-std::vector<notorious_fft_cmpl> x(1024);
-auto y = notorious_fft::dft(x);
 ```
 
-## API Reference
+Three commandments:
 
-### Transform Functions
+1. One plan per concurrent worker.
+2. You scale the inverse. Divide by N, or by Π 2N on r2r axes.
+3. `notorious_fft_malloc` / `fftw_malloc` are 64-byte aligned. Use them on the hot buffers.
 
-| Function | Description |
-|---|---|
-| `notorious_fft_dft(x, y, a)` | Forward complex DFT |
-| `notorious_fft_invdft(x, y, a)` | Inverse complex DFT (unnormalized) |
-| `notorious_fft_realdft(x, z, a)` | Forward real DFT |
-| `notorious_fft_invrealdft(z, y, a)` | Inverse real DFT (unnormalized) |
-| `notorious_fft_dct2(x, y, a)` | Type-2 Discrete Cosine Transform |
-| `notorious_fft_dst2(x, y, a)` | Type-2 Discrete Sine Transform |
-| `notorious_fft_dct3(x, y, a)` | Type-3 Discrete Cosine Transform |
-| `notorious_fft_dst3(x, y, a)` | Type-3 Discrete Sine Transform |
-| `notorious_fft_dct4(x, y, a)` | Type-4 Discrete Cosine Transform |
-| `notorious_fft_dst4(x, y, a)` | Type-4 Discrete Sine Transform |
-
-### Auxiliary Data Creation
-
-Auxiliary data contains precomputed twiddle factors and temporary buffers. It is reusable across multiple transforms of the same type and size.
-
-| Function | Description |
-|---|---|
-| `notorious_fft_mkaux_dft_1d(N)` | Aux for 1D complex DFT/IDFT |
-| `notorious_fft_mkaux_dft_2d(N1, N2)` | Aux for 2D complex DFT/IDFT |
-| `notorious_fft_mkaux_dft_3d(N1, N2, N3)` | Aux for 3D complex DFT/IDFT |
-| `notorious_fft_mkaux_dft(d, Ns)` | Aux for d-dimensional complex DFT/IDFT |
-| `notorious_fft_mkaux_realdft_1d(N)` | Aux for 1D real DFT/IDFT |
-| `notorious_fft_mkaux_realdft_2d(N1, N2)` | Aux for 2D real DFT/IDFT |
-| `notorious_fft_mkaux_realdft_3d(N1, N2, N3)` | Aux for 3D real DFT/IDFT |
-| `notorious_fft_mkaux_realdft(d, Ns)` | Aux for d-dimensional real DFT/IDFT |
-| `notorious_fft_mkaux_t2t3_1d(N)` | Aux for 1D DCT-2/DCT-3/DST-2/DST-3 |
-| `notorious_fft_mkaux_t4_1d(N)` | Aux for 1D DCT-4/DST-4 |
-| `notorious_fft_free_aux(a)` | Free auxiliary data |
-
-### Data Layout
-
-The tested real-to-real compatibility subset, formulas, normalization, length
-restrictions, and aliasing rules are documented in [docs/r2r.md](docs/r2r.md).
-Other existing data-layout conventions include:
-- Complex data is stored as interleaved real/imaginary pairs (`double[2]`)
-- Real DFT output has `N/2+1` complex elements
-- Disjoint real-DFT input is preserved in both directions; in-place real rows
-  require FFTW-style padding as documented in [docs/real-dft.md](docs/real-dft.md)
-
-## Building
-
-This is a header-only library. To use it, define `NOTORIOUS_FFT_IMPLEMENTATION` in exactly one translation unit before including the header:
+Awkward-length DCT-II is the same verb:
 
 ```c
-#define NOTORIOUS_FFT_IMPLEMENTATION
-#include "notorious_fft.h"
+notorious_fft_io_plan *p = notorious_fft_plan_r2r_1d(
+    257, in, out, NOTORIOUS_FFT_REDFT10, NOTORIOUS_FFT_ESTIMATE);
+notorious_fft_execute(p);
 ```
 
-### Compiler Flags
+### Transforms
+
+| Transform | Forward | Inverse | Lengths | Notes |
+|-----------|:-------:|:-------:|---------|-------|
+| Complex DFT | Yes | Yes, ×N | Any positive `int` | Split-radix / codelet / mixed / Rader / Bluestein |
+| Real DFT (r2c/c2r) | Yes | Yes, ×N | Any positive `int` | Packed `floor(N/2)+1` bins |
+| DCT-II / DCT-III | Yes | Yes, ×2N | Any positive `int` | FFT-backed for N≥3 |
+| DCT-IV / DST-IV | Yes | Yes, ×2N | Powers of two | |
+| DST-II / DST-III | Yes | Yes, ×2N | Powers of two in the FFTW r2r API | Legacy `mkaux_t2t3` still has a quadratic NPO2 DST kernel |
+
+### Planner
+
+| Group | Functions |
+|---|---|
+| Complex | `notorious_fft_plan_dft_1d/2d/3d`, `execute`, `execute_dft` |
+| Real | `notorious_fft_plan_dft_r2c_1d/2d`, `plan_dft_c2r_1d/2d` |
+| r2r | `notorious_fft_plan_r2r_1d/2d/3d`, `execute_r2r` |
+| Destroy | `notorious_fft_destroy_io_plan` |
+| Memory | `notorious_fft_malloc`, `notorious_fft_free` |
+| Legacy aux | `mkaux_dft_*`, `mkaux_realdft_*`, `mkaux_t2t3_*`, `mkaux_t4_*`, `free_aux` |
 
 | Flag | Effect |
 |---|---|
-| `-DNOTORIOUS_FFT_SINGLE` | Use single precision (float) instead of double |
-| `-DNOTORIOUS_FFT_FAST_MATH` | Bhaskara I twiddles (~0.1% max error; accumulates with N) |
-| `-march=armv8-a` / `-mavx2 -mfma` / `-mavx512f -mavx512dq` | Enable the matching SIMD path |
-| `-fopenmp` | Enable OpenMP (independent batches / large 1D stages) |
+| `-DNOTORIOUS_FFT_SINGLE` | `float` instead of `double` |
+| `-DNOTORIOUS_FFT_FAST_MATH` | Bhaskara I twiddles |
+| `-DNOTORIOUS_FFT_R2R_DCT_2N` | Optional 2N even-extension DCT |
+| `-march=armv8.2-a` / `-mavx2 -mfma` / `-mavx512f -mavx512dq` | Matching SIMD |
+| `-fopenmp` | Independent batches / large 1D stages |
 
-Do **not** pass `-ffast-math` if you care about matching libm accuracy.
+---
 
-### Running Tests
+## The Receipts
 
-```sh
+NVIDIA Jetson Orin Nano, Cortex-A78AE, Clang 22.1.3, `-O3 -DNDEBUG -march=armv8.2-a+dotprod+fp16`, double, `taskset -c 0`, 2026-10-21. FFTW 3.3.8 `FFTW_ESTIMATE`. Medians of 40–80 steady executes after warmup. Planning excluded.
+
+**Complex C2C, FP64 (µs):**
+
+| Size | Notorious FFT | FFTW3 ESTIMATE | Ratio |
+|-----:|--------------:|---------------:|------:|
+| 16 | 0.128 | 0.096 | 1.33× |
+| 64 | 0.544 | 0.576 | 0.94× |
+| 256 | 2.75 | 2.78 | 0.99× |
+| 257 | 7.01 | 9.79 | 0.72× |
+| 258 | 12.0 | 7.39 | 1.62× |
+| 511 | 20.3 | 21.7 | 0.94× |
+| 512 | 6.14 | 6.30 | 0.97× |
+| 513 | 10.0 | 11.0 | 0.91× |
+| 1024 | 13.7 | 14.6 | 0.93× |
+| 4096 | 68.2 | 72.6 | 0.94× |
+| 16384 | 336 | 377 | 0.89× |
+| 65536 | 1660 | 2002 | 0.83× |
+
+Mid-size powers of two sit on the same bar as ESTIMATE FFTW. 257, 511, and 513 go in front. 258 (2×3×43) is still the mo' problems size. CSV: [benchmarks/results/jetson_orin_nano_c2c.csv](benchmarks/results/jetson_orin_nano_c2c.csv).
+
+**DCT-II (REDFT10), same host:**
+
+| N | Notorious (µs) | FFTW3 (µs) | Ratio | Path |
+|--:|---------------:|-----------:|------:|------|
+| 256 | 2.30 | 2.24 | 1.03× | packed real DFT |
+| 257 | 7.81 | 7.97 | 0.98× | Rader → 256-point FFT |
+| 258 | 5.44 | 4.96 | 1.10× | packed real DFT of 129 = 43×3 |
+| 511 | 22.0 | 14.3 | 1.54× | Rader-511, inner 510 = 17×30 |
+| 512 | 4.83 | 4.64 | 1.04× | packed real DFT |
+| 513 | 11.6 | 7.65 | 1.52× | mixed 27×19 |
+
+v1.1.1 spent milliseconds at 257/511/513. v1.1.2 is O(N log N) and inside ~1.6× ESTIMATE FFTW. 257 is a good day. CSV: [benchmarks/results/jetson_orin_nano_r2r_dct.csv](benchmarks/results/jetson_orin_nano_r2r_dct.csv).
+
+**Versus minfft** (powers of two, same host, mean of many repeats):
+
+| N | minfft C2C (µs) | Notorious C2C (µs) | Ratio |
+|--:|----------------:|-------------------:|------:|
+| 256 | 3.54 | 2.71 | 1.31× |
+| 1024 | 17.4 | 13.7 | 1.27× |
+| 4096 | 85.8 | 68.9 | 1.24× |
+| 16384 | 417 | 353 | 1.18× |
+| 65536 | 2113 | 1649 | 1.28× |
+
+```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j
-./build/test_notoriousfft
-./build/test_notoriousfft_cpp
+cmake --build build --target bench bench_r2r_dct -j
+taskset -c 0 ./build/bench
+taskset -c 0 ./build/bench_r2r_dct
 ```
 
-### Running Benchmarks
+---
 
-```sh
-cmake -S . -B build -DNOTORIOUS_FFT_BUILD_BENCHMARKS=ON
-cmake --build build --target bench -j
-./build/bench
+## Build
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `NOTORIOUS_FFT_BUILD_TESTS` | ON | `test_notoriousfft`, r2r, real-DFT, consumers |
+| `NOTORIOUS_FFT_BUILD_BENCHMARKS` | ON | `bench`, `bench_r2r_dct`, mixed-size, OpenMP |
+| `NOTORIOUS_FFT_BUILD_EXAMPLES` | ON | basic, FFTW compat, C++ |
+| `NOTORIOUS_FFT_VALIDATE_FFTW` | OFF | FFTW3 differential r2r/r2c gates |
+| `NOTORIOUS_FFT_BUILD_COMPREHENSIVE_BENCHMARK` | OFF | Also fetch KissFFT / PocketFFT / muFFT / FFTW |
+| `NOTORIOUS_FFT_OPENMP` | ON | OpenMP when the compiler has it |
+| `NOTORIOUS_FFT_SINGLE` | OFF | Library-wide `float` |
+| `NOTORIOUS_FFT_FAST_MATH` | OFF | Bhaskara twiddles |
+
+Release is `-O3`. CMake detects NEON on AArch64 and AVX2/AVX-512 on x86.
+
+| Platform | NEON | SSE2 | AVX2 | AVX-512 |
+|----------|:----:|:----:|:----:|:-------:|
+| AArch64 | Yes | — | — | — |
+| x86_64 | — | Yes | Yes | Yes |
+
 ```
-
-For comprehensive benchmarking of all API functions:
-
-```sh
-./benchmarks/bench --all
+include/     amalgam · C++ wrapper · fftw aliases
+src/         01_core … 08_api · amalgamate.py
+tests/       oracles, r2r, real DFT, consumers
+benchmarks/  minfft, FFTW DCT, mixed sizes
+examples/    basic.c · fftw_compat.c · cpp_advanced.cpp
+docs/        r2r · real-DFT · v1.1.0 validation
 ```
-
-This runs benchmarks for all transform types:
-- Complex DFT (forward/inverse)
-- Real DFT (forward/inverse)
-- DCT Type 2/3
-- DST Type 2/3
-- DCT Type 4 / DST Type 4
-
-## Benchmark Results
-
-Latest benchmark run on ARM Cortex-A78AE (Jetson Orin), GCC 11.4.0 -O3 -march=armv8.2-a+fp16, double precision.
-
-### Quick Benchmark (vs minfft)
-
-```bash
-cd build
-cmake .. -DNOTORIOUS_FFT_BUILD_BENCHMARKS=ON
-make bench
-./bench
-```
-
-**Results (v1.0.0):**
-```
---- Complex DFT (Forward) ---
-N           minfft (us)   notoriousfft (us)  ratio
-------------------------------------------------------
-16          0.08          0.08          0.97x
-64          0.52          0.50          1.04x
-256         2.93          2.72          1.08x
-1024        15.23         13.86         1.10x
-4096        77.59         68.95         1.13x
-16384       384.39        354.75        1.08x
-65536       1896.76       1674.19       1.13x
-
---- Complex DFT (Inverse) ---
-16          0.08          0.08          0.927x
-64          0.52          0.49          1.050x
-256         2.93          2.68          1.092x
-1024        15.22         13.67         1.114x
-4096        81.41         69.07         1.179x
-16384       383.55        347.12        1.105x
-65536       1836.34       1635.89       1.123x
-
---- Real DFT (Forward) ---
-16          0.05          0.06          0.834x
-64          0.31          0.33          0.961x
-256         1.69          1.67          1.010x
-1024        8.50          8.16          1.041x
-4096        41.53         39.44         1.053x
-16384       199.84        195.27        1.023x
-65536       956.70        898.27        1.065x
-
---- DCT Type 2 ---
-16          0.09          0.10          0.866x
-64          0.46          0.46          1.002x
-256         2.28          2.21          1.027x
-1024        10.89         10.44         1.043x
-4096        50.98         48.34         1.055x
-16384       244.53        231.15        1.058x
-65536       1181.50       1079.74       1.094x
-```
-
-### Summary
-
-- **v1.0.0** beats minfft by **1.08–1.13×** on complex DFT for N≥256
-- N=16 is essentially tied (0.97×) after FFmpeg-style hardcoded twiddles
-- Mixed-radix **3/5/7**; **Rader** for primes with smooth N−1 (31, 127, 17, 257, …); Bluestein for awkward N
-- Four-step at N≥2²⁰; recursive split-radix is faster at 64K
-- SIMD: NEON (f64 + f32), AVX2 inverse, AVX-512 forward
-
-### Comprehensive Benchmark
-
-For comparison against FFTW3, KissFFT, PocketFFT, and muFFT:
-
-```bash
-cd build
-cmake .. -DNOTORIOUS_FFT_BUILD_COMPREHENSIVE_BENCHMARK=ON
-make comprehensive_bench
-./comprehensive_bench --text
-```
-
-### Visualization
-
-Generate performance plots with matplotlib:
-
-```bash
-./comprehensive_bench > results.json
-python3 ../benchmarks/plot_results.py results.json
-```
-
-This produces three plots:
-- `fft_benchmark_summary.png` - Execution time and GFLOP/s for all transforms
-- `fft_benchmark_speedup.png` - Speedup relative to NotoriousFFT
-- `fft_benchmark_normalized.png` - Normalized execution time (μs / (N log N))
-
-## Algorithm
-
-Notorious FFT uses split-radix (2/4) decimation-in-frequency by default (no bit-reversal; unrolled terminals for N≤32). `NOTORIOUS_FFT_MEASURE` may select a DIT combine or iterative Cooley–Tukey instead. Real transforms reduce to half-length complex FFTs. Mixed-radix 3/5/7 peels those factors even when the cofactor is prime. Prime lengths whose N−1 is 2·3·5·7-smooth use Rader (an (N−1)-point FFT), including small Mersenne primes 31 and 127 and Fermat primes 17 and 257. Padding a Mersenne length 2^p−1 with one zero and taking a 2^p FFT is a different transform (bin frequencies 2πk/2^p, not 2πk/n) and is not used. Awkward complex FFT sizes fall back to Bluestein. Power-of-two DCT-2/3 use real DFT pre/post twiddles; other positive lengths use a quadratic direct fallback. DCT-4/DST-4 retain their power-of-two restriction and reduce to an N/2-point complex DFT. Each FFT engine plan owns a 64-byte-aligned slab; r2r plans own additional axis auxiliaries and preallocated line buffers.
 
 ## License
 
-MIT License
-
-Copyright (c) 2025 adri4n <yo@adri4n.net>
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+MIT — see [LICENSE](LICENSE). Protect ya neck, cite the copyright.
